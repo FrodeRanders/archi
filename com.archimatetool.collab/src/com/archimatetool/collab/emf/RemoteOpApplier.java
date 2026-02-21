@@ -16,6 +16,7 @@ import com.archimatetool.model.IDocumentable;
 import com.archimatetool.model.IDiagramModelArchimateConnection;
 import com.archimatetool.model.IDiagramModelArchimateObject;
 import com.archimatetool.model.IDiagramModel;
+import com.archimatetool.model.IFolder;
 import com.archimatetool.model.IIdentifier;
 import com.archimatetool.model.INameable;
 import com.archimatetool.model.IProperties;
@@ -59,6 +60,54 @@ public class RemoteOpApplier {
         else {
             task.run();
         }
+    }
+
+    public void applySnapshotEnvelope(String envelopeJson) {
+        Display display = Display.getDefault();
+        Runnable task = () -> RemoteApplyGuard.runAsRemoteApply(() -> applySnapshotEnvelopeInternal(envelopeJson));
+        if(display != null && !display.isDisposed()) {
+            display.asyncExec(task);
+        }
+        else {
+            task.run();
+        }
+    }
+
+    private void applySnapshotEnvelopeInternal(String envelopeJson) {
+        if(envelopeJson == null || envelopeJson.isBlank()) {
+            return;
+        }
+
+        syncRevisionHint(envelopeJson);
+
+        String payload = SimpleJson.asJsonObject(SimpleJson.readRawField(envelopeJson, "payload"));
+        if(payload == null) {
+            ArchiCollabPlugin.logInfo("CheckoutSnapshot missing payload");
+            return;
+        }
+
+        String snapshot = SimpleJson.asJsonObject(SimpleJson.readRawField(payload, "snapshot"));
+        if(snapshot == null) {
+            snapshot = payload;
+        }
+
+        IArchimateModel model = sessionManager.getAttachedModel();
+        if(model == null) {
+            ArchiCollabPlugin.logInfo("CheckoutSnapshot ignored: no active model attached");
+            return;
+        }
+
+        clearDeferredOps();
+        clearModelContents(model);
+
+        int applied = 0;
+        applied += applySnapshotArray(snapshot, "elements", "CreateElement", "element");
+        applied += applySnapshotArray(snapshot, "relationships", "CreateRelationship", "relationship");
+        applied += applySnapshotArray(snapshot, "views", "CreateView", "view");
+        applied += applySnapshotArray(snapshot, "viewObjects", "CreateViewObject", "viewObject");
+        applied += applySnapshotArray(snapshot, "connections", "CreateConnection", "connection");
+
+        ArchiCollabPlugin.logInfo("Applied CheckoutSnapshot operations count=" + applied);
     }
 
     private void applyOpsEnvelopeInternal(String envelopeJson) {
@@ -185,6 +234,10 @@ public class RemoteOpApplier {
         deferredOps.add(new DeferredOp(opJson, System.currentTimeMillis(), 1));
         ArchiCollabPlugin.logDebug("Deferred remote op: " + summarizeOp(opJson));
         scheduleDeferredRetryIfNeeded();
+    }
+
+    private synchronized void clearDeferredOps() {
+        deferredOps.clear();
     }
 
     private synchronized int retryDeferredOps() {
@@ -765,5 +818,34 @@ public class RemoteOpApplier {
             return null;
         }
         return value.startsWith(prefix) ? value.substring(prefix.length()) : value;
+    }
+
+    private int applySnapshotArray(String snapshotJson, String arrayKey, String opType, String opFieldName) {
+        List<String> items = SimpleJson.readArrayObjectElements(snapshotJson, arrayKey);
+        int applied = 0;
+        for(String item : items) {
+            String opJson = "{\"type\":\"" + opType + "\",\"" + opFieldName + "\":" + item + "}";
+            if(applyOp(opJson)) {
+                applied++;
+            }
+            else {
+                ArchiCollabPlugin.logDebug("Snapshot op ignored/failed: " + summarizeOp(opJson));
+            }
+        }
+        return applied;
+    }
+
+    private void clearModelContents(IArchimateModel model) {
+        for(IFolder rootFolder : new ArrayList<>(model.getFolders())) {
+            clearFolder(rootFolder);
+        }
+    }
+
+    private void clearFolder(IFolder folder) {
+        for(IFolder child : new ArrayList<>(folder.getFolders())) {
+            clearFolder(child);
+        }
+        folder.getFolders().clear();
+        folder.getElements().clear();
     }
 }

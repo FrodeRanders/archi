@@ -27,6 +27,10 @@ public class InboundMessageDispatcher {
 
         switch(type) {
             case "CheckoutSnapshot":
+                syncRevisionHint(envelopeJson);
+                remoteOpApplier.applySnapshotEnvelope(envelopeJson);
+                ArchiCollabPlugin.logInfo("Received checkout payload type=" + type);
+                break;
             case "CheckoutDelta":
                 syncRevisionHint(envelopeJson);
                 applyCheckoutDeltaOps(envelopeJson);
