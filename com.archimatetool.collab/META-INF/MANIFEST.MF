@@ -1,0 +1,16 @@
+Manifest-Version: 1.0
+Bundle-ManifestVersion: 2
+Bundle-Name: %pluginName
+Bundle-SymbolicName: com.archimatetool.collab;singleton:=true
+Bundle-Version: 5.8.0.qualifier
+Bundle-Activator: com.archimatetool.collab.ArchiCollabPlugin
+Bundle-Vendor: %providerName
+Bundle-Localization: plugin
+Require-Bundle: org.eclipse.core.runtime,
+ org.eclipse.ui,
+ org.eclipse.emf.ecore,
+ com.archimatetool.model,
+ com.archimatetool.editor
+Bundle-ActivationPolicy: lazy
+Bundle-RequiredExecutionEnvironment: JavaSE-21
+Automatic-Module-Name: com.archimatetool.collab

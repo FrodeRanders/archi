@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?eclipse version="3.4"?>
+<plugin>
+   <extension
+         point="org.eclipse.ui.startup">
+      <startup
+            class="com.archimatetool.collab.startup.CollabStartup">
+      </startup>
+   </extension>
+
+   <extension
+         point="org.eclipse.ui.commands">
+      <command
+            categoryId="com.archimatetool.editor.category"
+            id="com.archimatetool.collab.command.connect"
+            name="%command.connect.name"
+            description="%command.connect.description">
+      </command>
+      <command
+            categoryId="com.archimatetool.editor.category"
+            id="com.archimatetool.collab.command.disconnect"
+            name="%command.disconnect.name"
+            description="%command.disconnect.description">
+      </command>
+   </extension>
+
+   <extension
+         point="org.eclipse.ui.handlers">
+      <handler
+            commandId="com.archimatetool.collab.command.connect"
+            class="com.archimatetool.collab.handlers.ConnectCollabHandler">
+      </handler>
+      <handler
+            commandId="com.archimatetool.collab.command.disconnect"
+            class="com.archimatetool.collab.handlers.DisconnectCollabHandler">
+      </handler>
+   </extension>
+
+   <extension
+         point="org.eclipse.ui.menus">
+      <menuContribution
+            allPopups="false"
+            locationURI="menu:tools?after=com.archimatetool.action.generateView">
+         <command
+               commandId="com.archimatetool.collab.command.connect"
+               label="%command.connect.label"
+               style="push">
+         </command>
+         <command
+               commandId="com.archimatetool.collab.command.disconnect"
+               label="%command.disconnect.label"
+               style="push">
+         </command>
+      </menuContribution>
+   </extension>
+</plugin>
