@@ -1,5 +1,6 @@
 bin/
 .settings/
+.DS_Store
 
 # Ignore Maven generated folders
 # Although it would be better to copy the source folders first and run Maven on the copy...
