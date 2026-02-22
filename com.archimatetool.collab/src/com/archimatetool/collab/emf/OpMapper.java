@@ -211,24 +211,32 @@ public class OpMapper {
     }
 
     public String toCreateConnectionSubmitOps(IDiagramModelArchimateConnection connection, String modelId, long baseRevision, String userId, String sessionId) {
-        String id = prefixedId("conn", connection);
-        String viewId = prefixedId("view", connection.getDiagramModel());
-        String representsId = prefixedId("rel", connection.getArchimateRelationship());
-        String sourceViewObjectId = prefixedId("vo", asIdentifier(connection.getSource()));
-        String targetViewObjectId = prefixedId("vo", asIdentifier(connection.getTarget()));
-
-        String op = "{" +
-                "\"type\":\"CreateConnection\"," +
-                "\"connection\":{" +
-                "\"id\":\"" + escape(id) + "\"," +
-                "\"viewId\":\"" + escape(viewId) + "\"," +
-                "\"representsId\":\"" + escape(representsId) + "\"," +
-                "\"sourceViewObjectId\":\"" + escape(sourceViewObjectId) + "\"," +
-                "\"targetViewObjectId\":\"" + escape(targetViewObjectId) + "\"," +
-                "\"notationJson\":" + notationJsonForConnection(connection) +
-                "}" +
-                "}";
+        String op = createConnectionOpJson(connection);
         return submitOpsEnvelope(modelId, baseRevision, userId, sessionId, op);
+    }
+
+    /**
+     * Emit relationship+connection creation in one batch so server preconditions
+     * can validate representsId against createdRelationshipIds deterministically.
+     */
+    public String toCreateConnectionWithRelationshipSubmitOps(IDiagramModelArchimateConnection connection, String modelId,
+            long baseRevision, String userId, String sessionId) {
+        IArchimateRelationship relationship = connection == null ? null : connection.getArchimateRelationship();
+        if(relationship == null) {
+            return toCreateConnectionSubmitOps(connection, modelId, baseRevision, userId, sessionId);
+        }
+        if(!hasIdentifier(connection)
+                || !hasIdentifier(connection.getDiagramModel())
+                || !hasIdentifier(asIdentifier(connection.getSource()))
+                || !hasIdentifier(asIdentifier(connection.getTarget()))
+                || !hasIdentifier(relationship)
+                || !hasIdentifier(relationship.getSource())
+                || !hasIdentifier(relationship.getTarget())) {
+            return null;
+        }
+        String relationshipOp = createRelationshipOpJson(relationship);
+        String connectionOp = createConnectionOpJson(connection);
+        return submitOpsEnvelope(modelId, baseRevision, userId, sessionId, relationshipOp, connectionOp);
     }
 
     public String toUpdateConnectionOpaqueSubmitOps(IDiagramModelArchimateConnection connection, String modelId, long baseRevision, String userId, String sessionId) {
@@ -289,6 +297,24 @@ public class OpMapper {
         return submitOpsEnvelope(modelId, baseRevision, userId, sessionId, op);
     }
 
+    public String toAddViewObjectChildMemberSubmitOps(String parentViewObjectId, String childViewObjectId, String modelId, long baseRevision, String userId, String sessionId) {
+        String op = "{" +
+                "\"type\":\"AddViewObjectChildMember\"," +
+                "\"parentViewObjectId\":\"" + escape(parentViewObjectId) + "\"," +
+                "\"childViewObjectId\":\"" + escape(childViewObjectId) + "\"" +
+                "}";
+        return submitOpsEnvelope(modelId, baseRevision, userId, sessionId, op);
+    }
+
+    public String toRemoveViewObjectChildMemberSubmitOps(String parentViewObjectId, String childViewObjectId, String modelId, long baseRevision, String userId, String sessionId) {
+        String op = "{" +
+                "\"type\":\"RemoveViewObjectChildMember\"," +
+                "\"parentViewObjectId\":\"" + escape(parentViewObjectId) + "\"," +
+                "\"childViewObjectId\":\"" + escape(childViewObjectId) + "\"" +
+                "}";
+        return submitOpsEnvelope(modelId, baseRevision, userId, sessionId, op);
+    }
+
     public String targetIdForOwner(Object owner) {
         if(owner instanceof IArchimateElement element) {
             return prefixedId("elem", element);
@@ -316,9 +342,21 @@ public class OpMapper {
         return property == null ? null : property.getValue();
     }
 
-    private String submitOpsEnvelope(String modelId, long baseRevision, String userId, String sessionId, String opJson) {
+    private String submitOpsEnvelope(String modelId, long baseRevision, String userId, String sessionId, String... opJsons) {
         String opBatchId = UUID.randomUUID().toString();
-        String opWithCausal = withCausal(opJson, userId, sessionId, opBatchId);
+        StringBuilder ops = new StringBuilder();
+        if(opJsons != null) {
+            for(int i = 0; i < opJsons.length; i++) {
+                String opWithCausal = withCausal(opJsons[i], userId, sessionId, opBatchId, i);
+                if(opWithCausal == null || opWithCausal.isBlank()) {
+                    continue;
+                }
+                if(ops.length() > 0) {
+                    ops.append(",");
+                }
+                ops.append(opWithCausal);
+            }
+        }
         return "{" +
                 "\"type\":\"SubmitOps\"," +
                 "\"payload\":{" +
@@ -330,7 +368,7 @@ public class OpMapper {
                 "\"sessionId\":\"" + escape(sessionId) + "\"" +
                 "}," +
                 "\"timestamp\":\"" + Instant.now() + "\"," +
-                "\"ops\":[" + opWithCausal + "]" +
+                "\"ops\":[" + ops + "]" +
                 "}" +
                 "}";
     }
@@ -341,7 +379,7 @@ public class OpMapper {
         return lamportCounter;
     }
 
-    private String withCausal(String opJson, String userId, String sessionId, String opBatchId) {
+    private String withCausal(String opJson, String userId, String sessionId, String opBatchId, int opIndex) {
         if(opJson == null || opJson.isBlank()) {
             return opJson;
         }
@@ -358,7 +396,7 @@ public class OpMapper {
         String causal = "\"causal\":{" +
                 "\"clientId\":\"" + escape(clientId) + "\"," +
                 "\"lamport\":" + lamport + "," +
-                "\"opId\":\"" + escape(opBatchId + ":0") + "\"" +
+                "\"opId\":\"" + escape(opBatchId + ":" + opIndex) + "\"" +
                 "}";
 
         String trimmed = opJson.trim();
@@ -374,6 +412,47 @@ public class OpMapper {
 
     private String getDocumentation(Object object) {
         return object instanceof IDocumentable ? ((IDocumentable)object).getDocumentation() : "";
+    }
+
+    private String createRelationshipOpJson(IArchimateRelationship relationship) {
+        String relationshipId = prefixedId("rel", relationship);
+        String archimateType = relationship.eClass().getName();
+        String name = relationship instanceof INameable ? ((INameable)relationship).getName() : "";
+        String documentation = relationship instanceof IDocumentable ? ((IDocumentable)relationship).getDocumentation() : "";
+        String sourceId = prefixedId("elem", relationship.getSource());
+        String targetId = prefixedId("elem", relationship.getTarget());
+
+        return "{" +
+                "\"type\":\"CreateRelationship\"," +
+                "\"relationship\":{" +
+                "\"id\":\"" + escape(relationshipId) + "\"," +
+                "\"archimateType\":\"" + escape(archimateType) + "\"," +
+                "\"name\":\"" + escape(name) + "\"," +
+                "\"documentation\":\"" + escape(documentation) + "\"," +
+                "\"sourceId\":\"" + escape(sourceId) + "\"," +
+                "\"targetId\":\"" + escape(targetId) + "\"" +
+                "}" +
+                "}";
+    }
+
+    private String createConnectionOpJson(IDiagramModelArchimateConnection connection) {
+        String id = prefixedId("conn", connection);
+        String viewId = prefixedId("view", connection.getDiagramModel());
+        String representsId = prefixedId("rel", connection.getArchimateRelationship());
+        String sourceViewObjectId = prefixedId("vo", asIdentifier(connection.getSource()));
+        String targetViewObjectId = prefixedId("vo", asIdentifier(connection.getTarget()));
+
+        return "{" +
+                "\"type\":\"CreateConnection\"," +
+                "\"connection\":{" +
+                "\"id\":\"" + escape(id) + "\"," +
+                "\"viewId\":\"" + escape(viewId) + "\"," +
+                "\"representsId\":\"" + escape(representsId) + "\"," +
+                "\"sourceViewObjectId\":\"" + escape(sourceViewObjectId) + "\"," +
+                "\"targetViewObjectId\":\"" + escape(targetViewObjectId) + "\"," +
+                "\"notationJson\":" + notationJsonForConnection(connection) +
+                "}" +
+                "}";
     }
 
     private String prefixedId(String prefix, IIdentifier object) {
@@ -394,6 +473,10 @@ public class OpMapper {
 
     private IIdentifier asIdentifier(IConnectable connectable) {
         return connectable instanceof IIdentifier ? (IIdentifier)connectable : null;
+    }
+
+    private boolean hasIdentifier(IIdentifier value) {
+        return value != null && value.getId() != null && !value.getId().isBlank();
     }
 
     private String notationJsonForViewObject(IDiagramModelArchimateObject viewObject) {

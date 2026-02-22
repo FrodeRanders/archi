@@ -22,6 +22,12 @@
             name="%command.disconnect.name"
             description="%command.disconnect.description">
       </command>
+      <command
+            categoryId="com.archimatetool.editor.category"
+            id="com.archimatetool.collab.command.showLastConflict"
+            name="%command.showLastConflict.name"
+            description="%command.showLastConflict.description">
+      </command>
    </extension>
 
    <extension
@@ -33,6 +39,10 @@
       <handler
             commandId="com.archimatetool.collab.command.disconnect"
             class="com.archimatetool.collab.handlers.DisconnectCollabHandler">
+      </handler>
+      <handler
+            commandId="com.archimatetool.collab.command.showLastConflict"
+            class="com.archimatetool.collab.handlers.ShowLastConflictHandler">
       </handler>
    </extension>
 
@@ -49,6 +59,11 @@
          <command
                commandId="com.archimatetool.collab.command.disconnect"
                label="%command.disconnect.label"
+               style="push">
+         </command>
+         <command
+               commandId="com.archimatetool.collab.command.showLastConflict"
+               label="%command.showLastConflict.label"
                style="push">
          </command>
       </menuContribution>

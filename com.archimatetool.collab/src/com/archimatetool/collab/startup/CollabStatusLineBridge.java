@@ -18,14 +18,18 @@ import com.archimatetool.collab.ws.CollabSessionManager;
 /**
  * Keeps a small collaboration status indicator in the active part's status line.
  */
-public class CollabStatusLineBridge implements IWindowListener, IPartListener, CollabSessionManager.SessionStateListener {
+public class CollabStatusLineBridge implements IWindowListener, IPartListener,
+        CollabSessionManager.SessionStateListener, CollabSessionManager.SubmitConflictListener {
 
     private static final String PREFIX = "Collab: ";
+    private static final int CONFLICT_BANNER_TTL_MS = 10000;
 
     private final CollabSessionManager sessionManager;
 
     private IWorkbench workbench;
     private IWorkbenchWindow activeWindow;
+    private volatile String conflictBannerMessage;
+    private volatile long conflictBannerUntilEpochMs;
 
     public CollabStatusLineBridge(CollabSessionManager sessionManager) {
         this.sessionManager = sessionManager;
@@ -37,6 +41,7 @@ public class CollabStatusLineBridge implements IWindowListener, IPartListener, C
         }
 
         sessionManager.addSessionStateListener(this);
+        sessionManager.addSubmitConflictListener(this);
 
         runOnUiThreadAsync(() -> {
             workbench = PlatformUI.getWorkbench();
@@ -48,6 +53,7 @@ public class CollabStatusLineBridge implements IWindowListener, IPartListener, C
 
     public void stop() {
         sessionManager.removeSessionStateListener(this);
+        sessionManager.removeSubmitConflictListener(this);
 
         runOnUiThreadSync(() -> {
             if(activeWindow != null) {
@@ -65,6 +71,16 @@ public class CollabStatusLineBridge implements IWindowListener, IPartListener, C
     @Override
     public void stateChanged(boolean connected, String modelId) {
         runOnUiThreadAsync(this::refreshStatusLine);
+    }
+
+    @Override
+    public void conflictDetected(String modelId, String opBatchId, String code, String message) {
+        conflictBannerMessage = "Conflict dropped (" + code + ")" + (modelId == null ? "" : " [" + modelId + "]");
+        conflictBannerUntilEpochMs = System.currentTimeMillis() + CONFLICT_BANNER_TTL_MS;
+        runOnUiThreadAsync(() -> {
+            refreshStatusLine();
+            scheduleConflictBannerClear();
+        });
     }
 
     @Override
@@ -150,7 +166,26 @@ public class CollabStatusLineBridge implements IWindowListener, IPartListener, C
             text = PREFIX + "Disconnected";
         }
 
+        long now = System.currentTimeMillis();
+        if(conflictBannerMessage != null && conflictBannerUntilEpochMs > now) {
+            statusLineManager.setErrorMessage(conflictBannerMessage);
+        }
+        else {
+            statusLineManager.setErrorMessage(null);
+            conflictBannerMessage = null;
+            conflictBannerUntilEpochMs = 0L;
+        }
         statusLineManager.setMessage(text);
+    }
+
+    private void scheduleConflictBannerClear() {
+        Display display = resolveDisplay();
+        if(display == null || display.isDisposed()) {
+            return;
+        }
+        long delayMs = Math.max(1L, conflictBannerUntilEpochMs - System.currentTimeMillis());
+        int boundedDelay = (int)Math.min(Integer.MAX_VALUE, delayMs);
+        display.timerExec(boundedDelay, this::refreshStatusLine);
     }
 
     private IStatusLineManager getStatusLineManager(IWorkbenchPart part) {

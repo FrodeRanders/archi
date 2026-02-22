@@ -42,9 +42,17 @@ public class CollabSessionManager {
     private static final String CACHE_DIR_NAME = "collab-cache";
     private static final int MAX_OUTBOX_SIZE = 1000;
     private static final String OUTBOX_FILE_SUFFIX = ".outbox.properties";
+    private static final long OUTBOX_RETRY_INITIAL_DELAY_MS = 250L;
+    private static final long OUTBOX_RETRY_MAX_DELAY_MS = 5000L;
+    private static final int OUTBOX_MAX_REPLAY_ATTEMPTS = 5;
+    private static final long OUTBOX_ACK_TIMEOUT_MS = 5000L;
 
     public interface SessionStateListener {
         void stateChanged(boolean connected, String modelId);
+    }
+
+    public interface SubmitConflictListener {
+        void conflictDetected(String modelId, String opBatchId, String code, String message);
     }
 
     private final HttpClient httpClient = HttpClient.newBuilder()
@@ -65,8 +73,15 @@ public class CollabSessionManager {
     private volatile boolean pendingCacheRevisionComparison;
     private volatile long cacheRevisionAtJoin = -1;
     private volatile boolean coldSnapshotRebuildRequested;
+    private volatile boolean outboxFlushInFlight;
+    private volatile boolean outboxRetryScheduled;
+    private volatile QueuedSubmitOp outboxAwaitingAck;
+    private volatile String outboxAwaitingAckOpBatchId;
+    private volatile long outboxAwaitingAckDeadlineEpochMs;
+    private volatile ConflictSnapshot lastConflictSnapshot;
     private final Deque<QueuedSubmitOp> offlineOutbox = new ArrayDeque<>();
     private final CopyOnWriteArrayList<SessionStateListener> sessionStateListeners = new CopyOnWriteArrayList<>();
+    private final CopyOnWriteArrayList<SubmitConflictListener> submitConflictListeners = new CopyOnWriteArrayList<>();
 
     public synchronized void connect(String baseWsUrl, String modelId) {
         Objects.requireNonNull(baseWsUrl, "baseWsUrl");
@@ -134,6 +149,9 @@ public class CollabSessionManager {
         cacheRevisionAtJoin = -1;
         pendingCacheRevisionComparison = false;
         coldSnapshotRebuildRequested = false;
+        outboxAwaitingAck = null;
+        outboxAwaitingAckOpBatchId = null;
+        outboxAwaitingAckDeadlineEpochMs = 0L;
         if(wasConnected) {
             fireStateChanged(false, null);
         }
@@ -291,6 +309,22 @@ public class CollabSessionManager {
         }
     }
 
+    public void addSubmitConflictListener(SubmitConflictListener listener) {
+        if(listener != null) {
+            submitConflictListeners.addIfAbsent(listener);
+        }
+    }
+
+    public void removeSubmitConflictListener(SubmitConflictListener listener) {
+        if(listener != null) {
+            submitConflictListeners.remove(listener);
+        }
+    }
+
+    public ConflictSnapshot getLastConflictSnapshot() {
+        return lastConflictSnapshot;
+    }
+
     private void fireStateChanged(boolean connected, String modelId) {
         for(SessionStateListener listener : sessionStateListeners) {
             listener.stateChanged(connected, modelId);
@@ -315,6 +349,15 @@ public class CollabSessionManager {
             enqueueOutbox(modelId, submitOpsJson, "websocket-disconnected");
             return;
         }
+        if(currentModelId != null && !currentModelId.isBlank() && !currentModelId.equals(modelId)) {
+            enqueueOutbox(modelId, submitOpsJson, "model-mismatch");
+            return;
+        }
+        if(outboxFlushInFlight || hasQueuedEntriesForModel(modelId)) {
+            enqueueOutbox(modelId, submitOpsJson, "ordered-drain");
+            flushOutboxIfPossible();
+            return;
+        }
         sendSubmitOverWebSocket(ws, modelId, submitOpsJson);
     }
 
@@ -334,7 +377,7 @@ public class CollabSessionManager {
             ArchiCollabPlugin.logInfo("Outbox full; dropping oldest queued SubmitOps modelId=" + dropped.modelId);
             persistOutboxToDisk(dropped.modelId);
         }
-        offlineOutbox.addLast(new QueuedSubmitOp(modelId, submitOpsJson, System.currentTimeMillis()));
+        offlineOutbox.addLast(new QueuedSubmitOp(modelId, submitOpsJson, System.currentTimeMillis(), 0, 0L));
         persistOutboxToDisk(modelId);
         ArchiCollabPlugin.logInfo("Queued SubmitOps for offline replay modelId=" + modelId
                 + " queueSize=" + offlineOutbox.size()
@@ -343,6 +386,9 @@ public class CollabSessionManager {
 
     private synchronized void flushOutboxIfPossible() {
         if(offlineOutbox.isEmpty()) {
+            return;
+        }
+        if(outboxFlushInFlight) {
             return;
         }
         WebSocket ws = webSocket;
@@ -355,35 +401,197 @@ public class CollabSessionManager {
         if(lastKnownRevision < 0) {
             return;
         }
-
-        List<QueuedSubmitOp> replay = new ArrayList<>();
-        Deque<QueuedSubmitOp> remainder = new ArrayDeque<>();
-        while(!offlineOutbox.isEmpty()) {
-            QueuedSubmitOp queued = offlineOutbox.removeFirst();
-            if(currentModelId.equals(queued.modelId)) {
-                replay.add(queued);
+        long now = System.currentTimeMillis();
+        if(outboxAwaitingAck != null) {
+            if(outboxAwaitingAckDeadlineEpochMs > now) {
+                scheduleOutboxRetry(outboxAwaitingAckDeadlineEpochMs - now);
+                return;
             }
-            else {
-                remainder.addLast(queued);
-            }
-        }
-        offlineOutbox.addAll(remainder);
-        persistOutboxToDisk(currentModelId);
-        if(replay.isEmpty()) {
+            QueuedSubmitOp timedOut = outboxAwaitingAck;
+            outboxAwaitingAck = null;
+            outboxAwaitingAckOpBatchId = null;
+            outboxAwaitingAckDeadlineEpochMs = 0L;
+            handleOutboxReplaySendResult(timedOut, new RuntimeException("ack-timeout"));
             return;
         }
 
-        ArchiCollabPlugin.logInfo("Replaying queued offline ops modelId=" + currentModelId
-                + " queuedCount=" + replay.size()
+        QueuedSubmitOp next = firstQueuedEntryForModel(currentModelId);
+        if(next == null) {
+            return;
+        }
+        if(next.nextRetryEpochMs > now) {
+            scheduleOutboxRetry(next.nextRetryEpochMs - now);
+            return;
+        }
+
+        outboxFlushInFlight = true;
+        String rebased = rebaseSubmitOpsBaseRevision(next.submitOpsJson, lastKnownRevision);
+        ArchiCollabPlugin.logInfo("Replaying queued offline op modelId=" + currentModelId
                 + " rebaseRevision=" + lastKnownRevision);
-        for(QueuedSubmitOp queued : replay) {
-            sendSubmitOverWebSocket(ws, queued.modelId, queued.submitOpsJson);
+        ArchiCollabPlugin.logTrace("WS OUT " + summarizeEnvelope(rebased));
+        ws.sendText(rebased, true).whenComplete((ignored, ex) -> handleOutboxReplaySendResult(next, ex));
+    }
+
+    private void handleOutboxReplaySendResult(QueuedSubmitOp replayed, Throwable error) {
+        synchronized(this) {
+            outboxFlushInFlight = false;
+            if(error == null) {
+                outboxAwaitingAck = replayed;
+                outboxAwaitingAckOpBatchId = extractOpBatchId(replayed.submitOpsJson);
+                outboxAwaitingAckDeadlineEpochMs = System.currentTimeMillis() + OUTBOX_ACK_TIMEOUT_MS;
+                scheduleOutboxRetry(OUTBOX_ACK_TIMEOUT_MS);
+            }
+            else {
+                offlineOutbox.remove(replayed);
+                int attempts = replayed.replayAttempts + 1;
+                if(attempts >= OUTBOX_MAX_REPLAY_ATTEMPTS) {
+                    ArchiCollabPlugin.logInfo("Dropping poison queued SubmitOps after max replay attempts modelId="
+                            + replayed.modelId + " attempts=" + attempts + " reason=" + error.getClass().getSimpleName());
+                    persistOutboxToDisk(replayed.modelId);
+                }
+                else {
+                    long retryDelayMs = computeOutboxRetryDelayMs(attempts);
+                    QueuedSubmitOp updated = new QueuedSubmitOp(
+                            replayed.modelId,
+                            replayed.submitOpsJson,
+                            replayed.queuedAtEpochMs,
+                            attempts,
+                            System.currentTimeMillis() + retryDelayMs);
+                    offlineOutbox.addFirst(updated);
+                    persistOutboxToDisk(replayed.modelId);
+                    ArchiCollabPlugin.logInfo("Retaining queued SubmitOps after replay send failure modelId="
+                            + replayed.modelId
+                            + " attempts=" + attempts
+                            + " retryDelayMs=" + retryDelayMs
+                            + " reason=" + error.getClass().getSimpleName());
+                    scheduleOutboxRetry(retryDelayMs);
+                }
+            }
+        }
+        flushOutboxIfPossible();
+    }
+
+    private QueuedSubmitOp firstQueuedEntryForModel(String modelId) {
+        for(QueuedSubmitOp queued : offlineOutbox) {
+            if(modelId.equals(queued.modelId)) {
+                return queued;
+            }
+        }
+        return null;
+    }
+
+    private boolean hasQueuedEntriesForModel(String modelId) {
+        return firstQueuedEntryForModel(modelId) != null;
+    }
+
+    private long computeOutboxRetryDelayMs(int attempts) {
+        if(attempts <= 0) {
+            return 0L;
+        }
+        long delay = OUTBOX_RETRY_INITIAL_DELAY_MS;
+        for(int i = 1; i < attempts; i++) {
+            delay = Math.min(OUTBOX_RETRY_MAX_DELAY_MS, delay * 2L);
+        }
+        return delay;
+    }
+
+    private void scheduleOutboxRetry(long delayMs) {
+        long boundedDelayMs = Math.max(1L, Math.min(OUTBOX_RETRY_MAX_DELAY_MS, delayMs));
+        synchronized(this) {
+            if(outboxRetryScheduled) {
+                return;
+            }
+            outboxRetryScheduled = true;
+        }
+        CompletableFuture.runAsync(
+                this::retryOutboxFlushAfterDelay,
+                CompletableFuture.delayedExecutor(boundedDelayMs, java.util.concurrent.TimeUnit.MILLISECONDS))
+                .exceptionally(ex -> {
+                    synchronized(this) {
+                        outboxRetryScheduled = false;
+                    }
+                    return null;
+                });
+    }
+
+    private void retryOutboxFlushAfterDelay() {
+        synchronized(this) {
+            outboxRetryScheduled = false;
+        }
+        flushOutboxIfPossible();
+    }
+
+    public void onServerOpsAccepted(String opBatchId) {
+        boolean advanced = false;
+        synchronized(this) {
+            if(outboxAwaitingAck != null && Objects.equals(opBatchId, outboxAwaitingAckOpBatchId)) {
+                QueuedSubmitOp accepted = outboxAwaitingAck;
+                outboxAwaitingAck = null;
+                outboxAwaitingAckOpBatchId = null;
+                outboxAwaitingAckDeadlineEpochMs = 0L;
+                offlineOutbox.remove(accepted);
+                persistOutboxToDisk(accepted.modelId);
+                advanced = true;
+            }
+        }
+        if(advanced) {
+            flushOutboxIfPossible();
+        }
+    }
+
+    public void onServerError(String code, String message) {
+        boolean retry = false;
+        boolean droppedConflict = false;
+        String conflictModelId = null;
+        String conflictOpBatchId = null;
+        synchronized(this) {
+            if(outboxAwaitingAck == null) {
+                return;
+            }
+            QueuedSubmitOp waiting = outboxAwaitingAck;
+            String waitingOpBatchId = outboxAwaitingAckOpBatchId;
+            outboxAwaitingAck = null;
+            outboxAwaitingAckOpBatchId = null;
+            outboxAwaitingAckDeadlineEpochMs = 0L;
+
+            if("PRECONDITION_FAILED".equals(code) || "LOCK_CONFLICT".equals(code)) {
+                offlineOutbox.remove(waiting);
+                persistOutboxToDisk(waiting.modelId);
+                droppedConflict = true;
+                conflictModelId = waiting.modelId;
+                conflictOpBatchId = waitingOpBatchId;
+            }
+            else {
+                retry = true;
+            }
+        }
+
+        if(droppedConflict) {
+            fireSubmitConflict(conflictModelId, conflictOpBatchId, code, message);
+            flushOutboxIfPossible();
+        }
+        if(retry) {
+            flushOutboxIfPossible();
+        }
+    }
+
+    private void fireSubmitConflict(String modelId, String opBatchId, String code, String message) {
+        lastConflictSnapshot = new ConflictSnapshot(modelId, opBatchId, code, message, System.currentTimeMillis());
+        ArchiCollabPlugin.logInfo("Dropping stale queued SubmitOps due to server conflict modelId="
+                + modelId + " opBatchId=" + opBatchId + " code=" + code + " message=" + message);
+        for(SubmitConflictListener listener : submitConflictListeners) {
+            listener.conflictDetected(modelId, opBatchId, code, message);
         }
     }
 
     private String extractModelId(String submitOpsJson) {
         String payload = SimpleJson.asJsonObject(SimpleJson.readRawField(submitOpsJson, "payload"));
         return payload == null ? null : SimpleJson.readStringField(payload, "modelId");
+    }
+
+    private String extractOpBatchId(String submitOpsJson) {
+        String payload = SimpleJson.asJsonObject(SimpleJson.readRawField(submitOpsJson, "payload"));
+        return payload == null ? null : SimpleJson.readStringField(payload, "opBatchId");
     }
 
     private String rebaseSubmitOpsBaseRevision(String submitOpsJson, long revision) {
@@ -707,10 +915,12 @@ public class CollabSessionManager {
                 continue;
             }
             long queuedAt = parseLong(properties.getProperty("item." + i + ".queuedAtEpochMs"), System.currentTimeMillis());
+            int replayAttempts = (int)parseLong(properties.getProperty("item." + i + ".replayAttempts"), 0L);
+            long nextRetryEpochMs = parseLong(properties.getProperty("item." + i + ".nextRetryEpochMs"), 0L);
             if(offlineOutbox.size() >= MAX_OUTBOX_SIZE) {
                 offlineOutbox.removeFirst();
             }
-            offlineOutbox.addLast(new QueuedSubmitOp(modelId, json, queuedAt));
+            offlineOutbox.addLast(new QueuedSubmitOp(modelId, json, queuedAt, replayAttempts, nextRetryEpochMs));
             loaded++;
         }
 
@@ -749,6 +959,8 @@ public class CollabSessionManager {
         for(int i = 0; i < modelEntries.size(); i++) {
             QueuedSubmitOp queued = modelEntries.get(i);
             properties.setProperty("item." + i + ".queuedAtEpochMs", String.valueOf(queued.queuedAtEpochMs));
+            properties.setProperty("item." + i + ".replayAttempts", String.valueOf(queued.replayAttempts));
+            properties.setProperty("item." + i + ".nextRetryEpochMs", String.valueOf(queued.nextRetryEpochMs));
             properties.setProperty("item." + i + ".payload", encodeBase64Utf8(queued.submitOpsJson));
         }
         try(FileOutputStream outputStream = new FileOutputStream(outboxFile)) {
@@ -873,6 +1085,16 @@ public class CollabSessionManager {
     private record QueuedSubmitOp(
             String modelId,
             String submitOpsJson,
-            long queuedAtEpochMs) {
+            long queuedAtEpochMs,
+            int replayAttempts,
+            long nextRetryEpochMs) {
+    }
+
+    public record ConflictSnapshot(
+            String modelId,
+            String opBatchId,
+            String code,
+            String message,
+            long occurredAtEpochMs) {
     }
 }

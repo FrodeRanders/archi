@@ -55,6 +55,7 @@ public class RemoteOpApplier {
     private final Map<String, CausalClock> propertyClocks = new HashMap<>();
     private final Map<String, CausalClock> propertyTombstones = new HashMap<>();
     private final Map<String, PropertySetMemberClock> propertySetMemberClocks = new HashMap<>();
+    private final Map<String, ViewObjectChildMemberClock> viewObjectChildMemberClocks = new HashMap<>();
     private final Map<String, FieldClock> viewObjectNotationClocks = new HashMap<>();
     private final Map<String, FieldClock> connectionNotationClocks = new HashMap<>();
     private boolean deferredRetryScheduled;
@@ -117,6 +118,7 @@ public class RemoteOpApplier {
         applied += applySnapshotArray(snapshot, "relationships", "CreateRelationship", "relationship");
         applied += applySnapshotArray(snapshot, "views", "CreateView", "view");
         applied += applySnapshotArray(snapshot, "viewObjects", "CreateViewObject", "viewObject");
+        applied += applySnapshotViewObjectChildMembers(snapshot);
         applied += applySnapshotArray(snapshot, "connections", "CreateConnection", "connection");
 
         ArchiCollabPlugin.logInfo("Applied CheckoutSnapshot operations count=" + applied);
@@ -185,6 +187,7 @@ public class RemoteOpApplier {
             case "UpdateRelationship" -> shouldDeferUpdateRelationship(opJson);
             case "UpdateViewObjectOpaque" -> shouldDeferViewObjectOpaque(opJson);
             case "UpdateConnectionOpaque" -> shouldDeferConnectionOpaque(opJson);
+            case "AddViewObjectChildMember", "RemoveViewObjectChildMember" -> shouldDeferViewObjectChildMember(opJson);
             default -> false;
         };
     }
@@ -273,6 +276,13 @@ public class RemoteOpApplier {
     private boolean shouldDeferConnectionOpaque(String opJson) {
         String connectionId = stripPrefix(SimpleJson.readStringField(opJson, "connectionId"), "conn:");
         return connectionId != null && findObjectById(connectionId) == null;
+    }
+
+    private boolean shouldDeferViewObjectChildMember(String opJson) {
+        String parentId = stripPrefix(SimpleJson.readStringField(opJson, "parentViewObjectId"), "vo:");
+        String childId = stripPrefix(SimpleJson.readStringField(opJson, "childViewObjectId"), "vo:");
+        return (parentId != null && findObjectById(parentId) == null)
+                || (childId != null && findObjectById(childId) == null);
     }
 
     private synchronized void deferOp(String opJson) {
@@ -402,6 +412,8 @@ public class RemoteOpApplier {
             case "UnsetProperty" -> applyUnsetProperty(opJson);
             case "AddPropertySetMember" -> applyAddPropertySetMember(opJson);
             case "RemovePropertySetMember" -> applyRemovePropertySetMember(opJson);
+            case "AddViewObjectChildMember" -> applyAddViewObjectChildMember(opJson);
+            case "RemoveViewObjectChildMember" -> applyRemoveViewObjectChildMember(opJson);
             case "UpdateViewObjectOpaque" -> applyViewObjectOpaque(opJson);
             case "UpdateConnectionOpaque" -> applyConnectionOpaque(opJson);
             default -> false;
@@ -995,6 +1007,87 @@ public class RemoteOpApplier {
         return true;
     }
 
+    private boolean applyAddViewObjectChildMember(String opJson) {
+        return applyViewObjectChildMember(opJson, false);
+    }
+
+    private boolean applyRemoveViewObjectChildMember(String opJson) {
+        return applyViewObjectChildMember(opJson, true);
+    }
+
+    private boolean applyViewObjectChildMember(String opJson, boolean deleted) {
+        String parentViewObjectId = SimpleJson.readStringField(opJson, "parentViewObjectId");
+        String childViewObjectId = SimpleJson.readStringField(opJson, "childViewObjectId");
+        if(parentViewObjectId == null || childViewObjectId == null) {
+            return false;
+        }
+        EObject parentObject = findPrefixedObject(parentViewObjectId);
+        EObject childObject = findPrefixedObject(childViewObjectId);
+        if(!(parentObject instanceof IDiagramModelArchimateObject parent)
+                || !(childObject instanceof IDiagramModelArchimateObject child)
+                || parent == child) {
+            return false;
+        }
+
+        CausalClock incoming = parseCausal(opJson);
+        String memberKey = viewObjectChildMemberKey(parentViewObjectId, childViewObjectId);
+        ViewObjectChildMemberClock existing = viewObjectChildMemberClocks.get(memberKey);
+        CrdtPropertyMerge.Clock existingAdd = existing != null && !existing.deleted
+                ? toMergeClock(existing.clock)
+                : null;
+        CrdtPropertyMerge.Clock existingRemove = existing != null && existing.deleted
+                ? toMergeClock(existing.clock)
+                : null;
+        boolean apply = deleted
+                ? CrdtOrSet.shouldApplyRemove(toMergeClock(incoming), existingAdd, existingRemove)
+                : CrdtOrSet.shouldApplyAdd(toMergeClock(incoming), existingAdd, existingRemove);
+        if(!apply) {
+            return false;
+        }
+
+        viewObjectChildMemberClocks.put(memberKey, new ViewObjectChildMemberClock(incoming, deleted));
+        rematerializeViewObjectChildMembership(childViewObjectId);
+        return true;
+    }
+
+    private void rematerializeViewObjectChildMembership(String childViewObjectId) {
+        EObject childObject = findPrefixedObject(childViewObjectId);
+        if(!(childObject instanceof IDiagramModelArchimateObject child)) {
+            return;
+        }
+
+        String suffix = "\u001f" + childViewObjectId;
+        String winnerParentId = null;
+        CausalClock winnerClock = null;
+        for(Map.Entry<String, ViewObjectChildMemberClock> entry : viewObjectChildMemberClocks.entrySet()) {
+            if(!entry.getKey().endsWith(suffix) || entry.getValue().deleted) {
+                continue;
+            }
+            int split = entry.getKey().indexOf('\u001f');
+            if(split <= 0) {
+                continue;
+            }
+            String candidateParentId = entry.getKey().substring(0, split);
+            CausalClock candidateClock = entry.getValue().clock;
+            if(winnerClock == null || wins(candidateClock, winnerClock)) {
+                winnerParentId = candidateParentId;
+                winnerClock = candidateClock;
+            }
+        }
+
+        if(child.eContainer() instanceof IDiagramModelContainer existingParent) {
+            existingParent.getChildren().remove(child);
+        }
+        if(winnerParentId == null) {
+            return;
+        }
+
+        EObject parentObject = findPrefixedObject(winnerParentId);
+        if(parentObject instanceof IDiagramModelArchimateObject parent && parent != child) {
+            parent.getChildren().add(child);
+        }
+    }
+
     private EObject findObjectById(String id) {
         IArchimateModel model = sessionManager.getAttachedModel();
         return ArchimateModelUtils.getObjectByID(model, id);
@@ -1165,12 +1258,37 @@ public class RemoteOpApplier {
         return applied;
     }
 
+    private int applySnapshotViewObjectChildMembers(String snapshotJson) {
+        List<String> members = SimpleJson.readArrayObjectElements(snapshotJson, "viewObjectChildMembers");
+        int applied = 0;
+        for(String member : members) {
+            String parentViewObjectId = SimpleJson.readStringField(member, "parentViewObjectId");
+            String childViewObjectId = SimpleJson.readStringField(member, "childViewObjectId");
+            if(parentViewObjectId == null || childViewObjectId == null) {
+                continue;
+            }
+            String opJson = "{"
+                    + "\"type\":\"AddViewObjectChildMember\","
+                    + "\"parentViewObjectId\":\"" + escapeJson(parentViewObjectId) + "\","
+                    + "\"childViewObjectId\":\"" + escapeJson(childViewObjectId) + "\""
+                    + "}";
+            if(applyOp(opJson)) {
+                applied++;
+            }
+            else {
+                ArchiCollabPlugin.logTrace("Snapshot op ignored/failed: " + summarizeOp(opJson));
+            }
+        }
+        return applied;
+    }
+
     private void clearModelContents(IArchimateModel model) {
         elementFieldClocks.clear();
         elementTombstones.clear();
         propertyClocks.clear();
         propertyTombstones.clear();
         propertySetMemberClocks.clear();
+        viewObjectChildMemberClocks.clear();
         viewObjectNotationClocks.clear();
         connectionNotationClocks.clear();
         List<EObject> views = new ArrayList<>();
@@ -1476,6 +1594,9 @@ public class RemoteOpApplier {
     private record PropertySetMemberClock(CausalClock clock, boolean deleted) {
     }
 
+    private record ViewObjectChildMemberClock(CausalClock clock, boolean deleted) {
+    }
+
     private void seedPropertySetStateFromCurrentValue(String targetId, String key, IProperties properties) {
         String prefix = propertySetMemberPrefix(targetId, key);
         boolean alreadySeeded = propertySetMemberClocks.keySet().stream().anyMatch(k -> k.startsWith(prefix));
@@ -1541,6 +1662,10 @@ public class RemoteOpApplier {
 
     private String propertySetMemberKey(String targetId, String key, String member) {
         return propertySetMemberPrefix(targetId, key) + member;
+    }
+
+    private String viewObjectChildMemberKey(String parentViewObjectId, String childViewObjectId) {
+        return parentViewObjectId + "\u001f" + childViewObjectId;
     }
 
     private List<String> parseStringArray(String rawValue) {
