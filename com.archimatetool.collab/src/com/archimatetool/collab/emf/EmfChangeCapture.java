@@ -49,17 +49,17 @@ public class EmfChangeCapture extends EContentAdapter {
     @Override
     public void notifyChanged(Notification notification) {
         super.notifyChanged(notification);
-        ArchiCollabPlugin.logDebug("EMF event type=" + eventTypeName(notification.getEventType())
+        ArchiCollabPlugin.logTrace("EMF event type=" + eventTypeName(notification.getEventType())
                 + " notifier=" + className(notification.getNotifier())
                 + " feature=" + featureName(notification));
 
         if(RemoteApplyGuard.isRemoteApply()) {
-            ArchiCollabPlugin.logDebug("EMF event ignored: remote apply guard active");
+            ArchiCollabPlugin.logTrace("EMF event ignored: remote apply guard active");
             return;
         }
 
         if(notification.getNotifier() == null || sessionManager == null || !sessionManager.isConnected()) {
-            ArchiCollabPlugin.logDebug("EMF event ignored: notifier/session missing or disconnected"
+            ArchiCollabPlugin.logTrace("EMF event ignored: notifier/session missing or disconnected"
                     + " notifierNull=" + (notification.getNotifier() == null)
                     + " sessionNull=" + (sessionManager == null)
                     + " connected=" + (sessionManager != null && sessionManager.isConnected()));
@@ -73,7 +73,7 @@ public class EmfChangeCapture extends EContentAdapter {
             case Notification.REMOVE_MANY -> handleRemoveMany(notification);
             case Notification.SET -> handleSet(notification);
             default -> {
-                ArchiCollabPlugin.logDebug("EMF event ignored: unsupported event type " + notification.getEventType());
+                ArchiCollabPlugin.logTrace("EMF event ignored: unsupported event type " + notification.getEventType());
             }
         }
     }
@@ -86,7 +86,7 @@ public class EmfChangeCapture extends EContentAdapter {
             }
             return;
         }
-        ArchiCollabPlugin.logDebug("ADD_MANY ignored: payload is not a collection (" + className(newValue) + ")");
+        ArchiCollabPlugin.logTrace("ADD_MANY ignored: payload is not a collection (" + className(newValue) + ")");
     }
 
     private void handleRemoveMany(Notification notification) {
@@ -97,7 +97,7 @@ public class EmfChangeCapture extends EContentAdapter {
             }
             return;
         }
-        ArchiCollabPlugin.logDebug("REMOVE_MANY ignored: payload is not a collection (" + className(oldValue) + ")");
+        ArchiCollabPlugin.logTrace("REMOVE_MANY ignored: payload is not a collection (" + className(oldValue) + ")");
     }
 
     private void handleAdd(Notification notification, Object newValue) {
@@ -168,7 +168,7 @@ public class EmfChangeCapture extends EContentAdapter {
                     "CreateConnection");
             return;
         }
-        ArchiCollabPlugin.logDebug("ADD ignored: no mapping for value type " + className(newValue));
+        ArchiCollabPlugin.logTrace("ADD ignored: no mapping for value type " + className(newValue));
     }
 
     private void handleRemove(Notification notification, Object oldValue) {
@@ -241,7 +241,7 @@ public class EmfChangeCapture extends EContentAdapter {
                     "DeleteConnection");
             return;
         }
-        ArchiCollabPlugin.logDebug("REMOVE ignored: no mapping for value type " + className(oldValue));
+        ArchiCollabPlugin.logTrace("REMOVE ignored: no mapping for value type " + className(oldValue));
     }
 
     private void handleSet(Notification notification) {
@@ -264,7 +264,7 @@ public class EmfChangeCapture extends EContentAdapter {
                         includeEndpoints),
                         "UpdateRelationship");
             } else {
-                ArchiCollabPlugin.logDebug("SET ignored for relationship feature=" + featureName);
+                ArchiCollabPlugin.logTrace("SET ignored for relationship feature=" + featureName);
             }
             return;
         }
@@ -283,7 +283,7 @@ public class EmfChangeCapture extends EContentAdapter {
                         includeDocumentation),
                         "UpdateElement");
             } else {
-                ArchiCollabPlugin.logDebug("SET ignored for element feature=" + featureName);
+                ArchiCollabPlugin.logTrace("SET ignored for element feature=" + featureName);
             }
             return;
         }
@@ -326,7 +326,7 @@ public class EmfChangeCapture extends EContentAdapter {
                         sessionManager.getSessionId()),
                         "SetProperty(connectionRouterType)");
             } else {
-                ArchiCollabPlugin.logDebug("SET ignored for view feature=" + featureName);
+                ArchiCollabPlugin.logTrace("SET ignored for view feature=" + featureName);
             }
             return;
         }
@@ -389,7 +389,7 @@ public class EmfChangeCapture extends EContentAdapter {
             Object owner = property.eContainer();
             String targetId = opMapper.targetIdForOwner(owner);
             if(targetId == null) {
-                ArchiCollabPlugin.logDebug("SET property ignored: could not resolve owner targetId");
+                ArchiCollabPlugin.logTrace("SET property ignored: could not resolve owner targetId");
                 return;
             }
             String feature = featureName(notification);
@@ -418,11 +418,11 @@ public class EmfChangeCapture extends EContentAdapter {
                         sessionManager.getSessionId()),
                         "SetProperty(update)");
             } else {
-                ArchiCollabPlugin.logDebug("SET property ignored: key is blank");
+                ArchiCollabPlugin.logTrace("SET property ignored: key is blank");
             }
             return;
         }
-        ArchiCollabPlugin.logDebug("SET ignored: no mapping for notifier type " + className(notifier) + " feature=" + featureName);
+        ArchiCollabPlugin.logTrace("SET ignored: no mapping for notifier type " + className(notifier) + " feature=" + featureName);
     }
 
     private String featureName(Notification notification) {
@@ -435,7 +435,7 @@ public class EmfChangeCapture extends EContentAdapter {
 
     private void send(String submitOpsJson, String opLabel) {
         if(submitOpsJson == null || submitOpsJson.isBlank()) {
-            ArchiCollabPlugin.logDebug("Submit skipped for opLabel=" + opLabel + " because mapped payload is empty");
+            ArchiCollabPlugin.logTrace("Submit skipped for opLabel=" + opLabel + " because mapped payload is empty");
             return;
         }
         sessionManager.sendSubmitOps(submitOpsJson);

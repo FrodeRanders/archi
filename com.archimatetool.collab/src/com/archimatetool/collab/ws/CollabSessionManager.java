@@ -72,7 +72,12 @@ public class CollabSessionManager {
                 webSocket.sendClose(WebSocket.NORMAL_CLOSURE, "disconnect").join();
             }
             catch(Exception ex) {
-                ArchiCollabPlugin.logError("Error closing collaboration websocket", ex);
+                if(isExpectedCloseException(ex)) {
+                    ArchiCollabPlugin.logDebug("Collaboration websocket already closed while disconnecting");
+                }
+                else {
+                    ArchiCollabPlugin.logError("Error closing collaboration websocket", ex);
+                }
             }
         }
 
@@ -81,6 +86,18 @@ public class CollabSessionManager {
         if(wasConnected) {
             fireStateChanged(false, null);
         }
+    }
+
+    private boolean isExpectedCloseException(Throwable throwable) {
+        Throwable cursor = throwable;
+        while(cursor != null) {
+            String message = cursor.getMessage();
+            if(message != null && message.contains("Output closed")) {
+                return true;
+            }
+            cursor = cursor.getCause();
+        }
+        return false;
     }
 
     public synchronized void setActor(String userId, String sessionId) {
@@ -210,11 +227,11 @@ public class CollabSessionManager {
     private void sendRaw(String payload) {
         WebSocket ws = webSocket;
         if(ws == null) {
-            ArchiCollabPlugin.logDebug("sendRaw skipped: websocket not connected payload=" + summarizeEnvelope(payload));
+            ArchiCollabPlugin.logTrace("sendRaw skipped: websocket not connected payload=" + summarizeEnvelope(payload));
             return;
         }
 
-        ArchiCollabPlugin.logDebug("WS OUT " + summarizeEnvelope(payload));
+        ArchiCollabPlugin.logTrace("WS OUT " + summarizeEnvelope(payload));
         ws.sendText(payload, true).exceptionally(ex -> {
             ArchiCollabPlugin.logError("Failed sending collaboration message", ex);
             return null;
@@ -238,11 +255,11 @@ public class CollabSessionManager {
             fragments.append(data);
             if(last) {
                 String message = fragments.toString();
-                ArchiCollabPlugin.logDebug("WS IN " + summarizeEnvelope(message));
-                if(ArchiCollabPlugin.isDebugEnabled()) {
+                ArchiCollabPlugin.logTrace("WS IN " + summarizeEnvelope(message));
+                if(ArchiCollabPlugin.isTraceEnabled()) {
                     String type = SimpleJson.readStringField(message, "type");
                     if("OpsBroadcast".equals(type)) {
-                        ArchiCollabPlugin.logDebug("WS IN RAW OpsBroadcast " + message);
+                        ArchiCollabPlugin.logTrace("WS IN RAW OpsBroadcast " + message);
                     }
                 }
                 inboundMessageDispatcher.dispatch(message);

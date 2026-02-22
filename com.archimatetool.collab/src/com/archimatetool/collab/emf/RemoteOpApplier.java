@@ -16,7 +16,6 @@ import com.archimatetool.model.IDocumentable;
 import com.archimatetool.model.IDiagramModelArchimateConnection;
 import com.archimatetool.model.IDiagramModelArchimateObject;
 import com.archimatetool.model.IDiagramModel;
-import com.archimatetool.model.IFolder;
 import com.archimatetool.model.IIdentifier;
 import com.archimatetool.model.INameable;
 import com.archimatetool.model.IProperties;
@@ -150,7 +149,7 @@ public class RemoteOpApplier {
                     deferOp(op);
                 }
                 else {
-                    ArchiCollabPlugin.logDebug("Remote op ignored/failed: " + summarizeOp(op));
+                    ArchiCollabPlugin.logTrace("Remote op ignored/failed: " + summarizeOp(op));
                 }
             }
         }
@@ -229,10 +228,10 @@ public class RemoteOpApplier {
         }
         if(deferredOps.size() >= MAX_DEFERRED_QUEUE_SIZE) {
             DeferredOp dropped = deferredOps.remove(0);
-            ArchiCollabPlugin.logDebug("Deferred queue full, dropping oldest remote op: " + summarizeOp(dropped.opJson));
+            ArchiCollabPlugin.logTrace("Deferred queue full, dropping oldest remote op: " + summarizeOp(dropped.opJson));
         }
         deferredOps.add(new DeferredOp(opJson, System.currentTimeMillis(), 1));
-        ArchiCollabPlugin.logDebug("Deferred remote op: " + summarizeOp(opJson));
+        ArchiCollabPlugin.logTrace("Deferred remote op: " + summarizeOp(opJson));
         scheduleDeferredRetryIfNeeded();
     }
 
@@ -255,7 +254,7 @@ public class RemoteOpApplier {
             }
             long ageMillis = now - deferred.firstSeenAtMillis;
             if(ageMillis >= MAX_DEFERRED_AGE_MILLIS) {
-                ArchiCollabPlugin.logDebug("Deferred remote op dropped after timeout: "
+                ArchiCollabPlugin.logTrace("Deferred remote op dropped after timeout: "
                         + summarizeOp(deferred.opJson)
                         + " ageMs=" + ageMillis
                         + " attempts=" + deferred.attempts);
@@ -380,7 +379,7 @@ public class RemoteOpApplier {
             return false;
         }
         model.getDefaultFolderForObject(concept).getElements().add(concept);
-        ArchiCollabPlugin.logDebug("Applied CreateElement id=elem:" + elementId + " name=" + getName(concept));
+        ArchiCollabPlugin.logTrace("Applied CreateElement id=elem:" + elementId + " name=" + getName(concept));
         return true;
     }
 
@@ -398,7 +397,7 @@ public class RemoteOpApplier {
         if(concept instanceof IDocumentable documentable) {
             setIfPresentDocumentation(documentable, patchJson, "documentation");
         }
-        ArchiCollabPlugin.logDebug("Applied UpdateElement id=elem:" + elementId + " patch=" + summarizePatch(patchJson));
+        ArchiCollabPlugin.logTrace("Applied UpdateElement id=elem:" + elementId + " patch=" + summarizePatch(patchJson));
         return true;
     }
 
@@ -409,7 +408,7 @@ public class RemoteOpApplier {
             return false;
         }
         EcoreUtil.delete(eObject, true);
-        ArchiCollabPlugin.logDebug("Applied DeleteElement id=elem:" + elementId);
+        ArchiCollabPlugin.logTrace("Applied DeleteElement id=elem:" + elementId);
         return true;
     }
 
@@ -454,7 +453,7 @@ public class RemoteOpApplier {
             return false;
         }
         model.getDefaultFolderForObject(relationship).getElements().add(relationship);
-        ArchiCollabPlugin.logDebug("Applied CreateRelationship id=rel:" + relationshipId + " name=" + getName(relationship));
+        ArchiCollabPlugin.logTrace("Applied CreateRelationship id=rel:" + relationshipId + " name=" + getName(relationship));
         return true;
     }
 
@@ -481,7 +480,7 @@ public class RemoteOpApplier {
         if(target instanceof IArchimateConcept targetConcept) {
             relationship.setTarget(targetConcept);
         }
-        ArchiCollabPlugin.logDebug("Applied UpdateRelationship id=rel:" + relationshipId + " patch=" + summarizePatch(patchJson));
+        ArchiCollabPlugin.logTrace("Applied UpdateRelationship id=rel:" + relationshipId + " patch=" + summarizePatch(patchJson));
         return true;
     }
 
@@ -492,7 +491,7 @@ public class RemoteOpApplier {
             return false;
         }
         EcoreUtil.delete(eObject, true);
-        ArchiCollabPlugin.logDebug("Applied DeleteRelationship id=rel:" + relationshipId);
+        ArchiCollabPlugin.logTrace("Applied DeleteRelationship id=rel:" + relationshipId);
         return true;
     }
 
@@ -519,7 +518,7 @@ public class RemoteOpApplier {
             return false;
         }
         model.getDefaultFolderForObject(view).getElements().add(view);
-        ArchiCollabPlugin.logDebug("Applied CreateView id=view:" + viewId + " name=" + getName(view));
+        ArchiCollabPlugin.logTrace("Applied CreateView id=view:" + viewId + " name=" + getName(view));
         return true;
     }
 
@@ -537,7 +536,7 @@ public class RemoteOpApplier {
         if(view instanceof IDocumentable documentable) {
             setIfPresentDocumentation(documentable, patchJson, "documentation");
         }
-        ArchiCollabPlugin.logDebug("Applied UpdateView id=view:" + viewId + " patch=" + summarizePatch(patchJson));
+        ArchiCollabPlugin.logTrace("Applied UpdateView id=view:" + viewId + " patch=" + summarizePatch(patchJson));
         return true;
     }
 
@@ -548,7 +547,7 @@ public class RemoteOpApplier {
             return false;
         }
         EcoreUtil.delete(eObject, true);
-        ArchiCollabPlugin.logDebug("Applied DeleteView id=view:" + viewId);
+        ArchiCollabPlugin.logTrace("Applied DeleteView id=view:" + viewId);
         return true;
     }
 
@@ -583,7 +582,7 @@ public class RemoteOpApplier {
         }
 
         view.getChildren().add(viewObject);
-        ArchiCollabPlugin.logDebug("Applied CreateViewObject id=vo:" + viewObjectId + " represents=" + SimpleJson.readStringField(viewObjectJson, "representsId"));
+        ArchiCollabPlugin.logTrace("Applied CreateViewObject id=vo:" + viewObjectId + " represents=" + SimpleJson.readStringField(viewObjectJson, "representsId"));
         return true;
     }
 
@@ -594,7 +593,7 @@ public class RemoteOpApplier {
             return false;
         }
         EcoreUtil.delete(eObject, true);
-        ArchiCollabPlugin.logDebug("Applied DeleteViewObject id=vo:" + viewObjectId);
+        ArchiCollabPlugin.logTrace("Applied DeleteViewObject id=vo:" + viewObjectId);
         return true;
     }
 
@@ -629,7 +628,7 @@ public class RemoteOpApplier {
         if(notationJson != null) {
             notationDeserializer.applyConnectionNotation(connection, notationJson);
         }
-        ArchiCollabPlugin.logDebug("Applied CreateConnection id=conn:" + connectionId + " represents=" + SimpleJson.readStringField(connectionJson, "representsId"));
+        ArchiCollabPlugin.logTrace("Applied CreateConnection id=conn:" + connectionId + " represents=" + SimpleJson.readStringField(connectionJson, "representsId"));
         return true;
     }
 
@@ -640,7 +639,7 @@ public class RemoteOpApplier {
             return false;
         }
         EcoreUtil.delete(eObject, true);
-        ArchiCollabPlugin.logDebug("Applied DeleteConnection id=conn:" + connectionId);
+        ArchiCollabPlugin.logTrace("Applied DeleteConnection id=conn:" + connectionId);
         return true;
     }
 
@@ -659,7 +658,7 @@ public class RemoteOpApplier {
         for(IProperty property : properties.getProperties()) {
             if(key.equals(property.getKey())) {
                 property.setValue(value);
-                ArchiCollabPlugin.logDebug("Applied SetProperty target=" + targetId + " key=" + key + " value=" + value);
+                ArchiCollabPlugin.logTrace("Applied SetProperty target=" + targetId + " key=" + key + " value=" + value);
                 return true;
             }
         }
@@ -668,7 +667,7 @@ public class RemoteOpApplier {
         property.setKey(key);
         property.setValue(value);
         properties.getProperties().add(property);
-        ArchiCollabPlugin.logDebug("Applied SetProperty target=" + targetId + " key=" + key + " value=" + value + " (new)");
+        ArchiCollabPlugin.logTrace("Applied SetProperty target=" + targetId + " key=" + key + " value=" + value + " (new)");
         return true;
     }
 
@@ -692,7 +691,7 @@ public class RemoteOpApplier {
         }
         if(match != null) {
             properties.getProperties().remove(match);
-            ArchiCollabPlugin.logDebug("Applied UnsetProperty target=" + targetId + " key=" + key);
+            ArchiCollabPlugin.logTrace("Applied UnsetProperty target=" + targetId + " key=" + key);
             return true;
         }
         return false;
@@ -710,7 +709,7 @@ public class RemoteOpApplier {
             return false;
         }
         notationDeserializer.applyViewObjectNotation(viewObject, notationJson);
-        ArchiCollabPlugin.logDebug("Applied UpdateViewObjectOpaque id=vo:" + viewObjectId);
+        ArchiCollabPlugin.logTrace("Applied UpdateViewObjectOpaque id=vo:" + viewObjectId);
         return true;
     }
 
@@ -726,7 +725,7 @@ public class RemoteOpApplier {
             return false;
         }
         notationDeserializer.applyConnectionNotation(connection, notationJson);
-        ArchiCollabPlugin.logDebug("Applied UpdateConnectionOpaque id=conn:" + connectionId);
+        ArchiCollabPlugin.logTrace("Applied UpdateConnectionOpaque id=conn:" + connectionId);
         return true;
     }
 
@@ -829,23 +828,34 @@ public class RemoteOpApplier {
                 applied++;
             }
             else {
-                ArchiCollabPlugin.logDebug("Snapshot op ignored/failed: " + summarizeOp(opJson));
+                ArchiCollabPlugin.logTrace("Snapshot op ignored/failed: " + summarizeOp(opJson));
             }
         }
         return applied;
     }
 
     private void clearModelContents(IArchimateModel model) {
-        for(IFolder rootFolder : new ArrayList<>(model.getFolders())) {
-            clearFolder(rootFolder);
+        List<EObject> views = new ArrayList<>();
+        List<EObject> concepts = new ArrayList<>();
+
+        for(var iter = model.eAllContents(); iter.hasNext();) {
+            EObject object = iter.next();
+            if(object instanceof IDiagramModel) {
+                views.add(object);
+            }
+            else if(object instanceof IArchimateConcept) {
+                concepts.add(object);
+            }
+        }
+
+        // Delete view content first so diagram edit parts never observe dangling view objects.
+        for(EObject view : views) {
+            EcoreUtil.delete(view, true);
+        }
+
+        for(EObject concept : concepts) {
+            EcoreUtil.delete(concept, true);
         }
     }
 
-    private void clearFolder(IFolder folder) {
-        for(IFolder child : new ArrayList<>(folder.getFolders())) {
-            clearFolder(child);
-        }
-        folder.getFolders().clear();
-        folder.getElements().clear();
-    }
 }

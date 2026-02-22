@@ -20,6 +20,9 @@ public class ArchiCollabPlugin extends AbstractUIPlugin {
     private static volatile boolean debugEnabled =
             Boolean.parseBoolean(System.getProperty("archi.collab.debug", "false"))
                     || "true".equalsIgnoreCase(System.getenv("ARCHI_COLLAB_DEBUG"));
+    private static volatile boolean traceEnabled =
+            Boolean.parseBoolean(System.getProperty("archi.collab.trace", "false"))
+                    || "true".equalsIgnoreCase(System.getenv("ARCHI_COLLAB_TRACE"));
 
     private CollabSessionManager sessionManager;
     private WorkbenchModelLifecycleBridge lifecycleBridge;
@@ -48,6 +51,16 @@ public class ArchiCollabPlugin extends AbstractUIPlugin {
 
     public static boolean isDebugEnabled() {
         return debugEnabled;
+    }
+
+    public static void logTrace(String message) {
+        if(traceEnabled) {
+            logInfo("[TRACE] " + message);
+        }
+    }
+
+    public static boolean isTraceEnabled() {
+        return traceEnabled;
     }
 
     public static void logError(String message, Throwable throwable) {

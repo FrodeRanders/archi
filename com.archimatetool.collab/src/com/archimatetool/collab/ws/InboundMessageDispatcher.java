@@ -41,7 +41,7 @@ public class InboundMessageDispatcher {
                 ArchiCollabPlugin.logInfo("Received OpsAccepted");
                 break;
             case "OpsBroadcast":
-                ArchiCollabPlugin.logDebug("Dispatching OpsBroadcast: " + summarizeOpsBroadcast(envelopeJson));
+                ArchiCollabPlugin.logTrace("Dispatching OpsBroadcast: " + summarizeOpsBroadcast(envelopeJson));
                 remoteOpApplier.applyOpsEnvelope(envelopeJson);
                 break;
             case "LockEvent":
@@ -120,7 +120,7 @@ public class InboundMessageDispatcher {
             String syntheticEnvelope = "{\"type\":\"OpsBroadcast\",\"payload\":{\"opBatch\":" + opBatch + "}}";
             remoteOpApplier.applyOpsEnvelope(syntheticEnvelope);
         }
-        ArchiCollabPlugin.logDebug("Applied checkout delta op batches count=" + opBatches.size());
+        ArchiCollabPlugin.logTrace("Applied checkout delta op batches count=" + opBatches.size());
     }
 
     private String readStringField(String json, String key) {
