@@ -20,12 +20,14 @@ import java.util.ArrayList;
 import java.util.Deque;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 
 import org.junit.jupiter.api.Test;
 
 import com.archimatetool.collab.ws.CollabSessionManager;
+import org.eclipse.swt.widgets.Display;
 
 @SuppressWarnings("unchecked")
 public class CollabSessionManagerDurableOutboxTests {
@@ -62,6 +64,53 @@ public class CollabSessionManagerDurableOutboxTests {
         finally {
             deleteIfExists(outboxFile);
         }
+    }
+
+    @Test
+    public void cachePersistIsSkippedWhenWorkbenchUnavailable() throws Exception {
+        TestableSessionManager manager = new TestableSessionManager(false, null);
+        setPrivateField(manager, "serverBackedSession", true);
+        setPrivateField(manager, "lastCacheSaveEpochMillis", 0L);
+
+        invokePrivate(manager, "maybePersistCacheSnapshot", new Class<?>[] { String.class, boolean.class }, "test", true);
+
+        long lastSavedAt = (long)getPrivateField(manager, "lastCacheSaveEpochMillis");
+        assertEquals(0L, lastSavedAt, "Expected no cache persistence attempt while workbench is unavailable");
+    }
+
+    @Test
+    public void uiThreadSyncReturnsFalseWhenDisplayUnavailable() throws Exception {
+        TestableSessionManager manager = new TestableSessionManager(true, null);
+        AtomicBoolean executed = new AtomicBoolean(false);
+
+        boolean result = (boolean)invokePrivate(
+                manager,
+                "runOnUiThreadSync",
+                new Class<?>[] { Runnable.class },
+                (Runnable)(() -> executed.set(true)));
+
+        assertFalse(result, "Expected UI sync helper to report unavailable display");
+        assertFalse(executed.get(), "Runnable should not execute when display is unavailable");
+    }
+
+    @Test
+    public void uiThreadSyncExecutesWhenDisplayAvailable() throws Exception {
+        Display display = Display.getDefault();
+        if(display == null || display.isDisposed()) {
+            return;
+        }
+
+        TestableSessionManager manager = new TestableSessionManager(true, display);
+        AtomicBoolean executed = new AtomicBoolean(false);
+
+        boolean result = (boolean)invokePrivate(
+                manager,
+                "runOnUiThreadSync",
+                new Class<?>[] { Runnable.class },
+                (Runnable)(() -> executed.set(true)));
+
+        assertTrue(result, "Expected UI sync helper to run when display is available");
+        assertTrue(executed.get(), "Runnable should execute when display is available");
     }
 
     private String submitOpsEnvelope(String modelId, long baseRevision, String opBatchId) {
@@ -158,6 +207,26 @@ public class CollabSessionManagerDurableOutboxTests {
 
         @Override
         public void abort() {
+        }
+    }
+
+    private static final class TestableSessionManager extends CollabSessionManager {
+        private final boolean workbenchRunning;
+        private final Display display;
+
+        private TestableSessionManager(boolean workbenchRunning, Display display) {
+            this.workbenchRunning = workbenchRunning;
+            this.display = display;
+        }
+
+        @Override
+        protected boolean isWorkbenchRunning() {
+            return workbenchRunning;
+        }
+
+        @Override
+        protected Display getDisplay() {
+            return display;
         }
     }
 }

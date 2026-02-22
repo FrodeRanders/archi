@@ -32,6 +32,7 @@ import com.archimatetool.editor.model.IEditorModelManager;
 import com.archimatetool.model.IArchimateModel;
 import org.eclipse.swt.SWTException;
 import org.eclipse.swt.widgets.Display;
+import org.eclipse.ui.PlatformUI;
 
 /**
  * Manages a single websocket collaboration session for now.
@@ -533,6 +534,10 @@ public class CollabSessionManager {
         if(!serverBackedSession) {
             return;
         }
+        if(!canPersistCacheSnapshot()) {
+            ArchiCollabPlugin.logTrace("Skipping collaboration cache persist while workbench is shutting down: reason=" + reason);
+            return;
+        }
         IArchimateModel model = attachedModel;
         String modelId = currentModelId;
         if(model == null || modelId == null || modelId.isBlank()) {
@@ -544,8 +549,12 @@ public class CollabSessionManager {
             return;
         }
 
-        runOnUiThreadSync(() -> {
+        boolean executed = runOnUiThreadSync(() -> {
             try {
+                if(!canPersistCacheSnapshot()) {
+                    ArchiCollabPlugin.logTrace("Skipping collaboration cache persist on UI thread during shutdown: reason=" + reason);
+                    return;
+                }
                 File cacheFile = resolveCacheFile(modelId);
                 if(cacheFile == null) {
                     return;
@@ -574,6 +583,9 @@ public class CollabSessionManager {
                 ArchiCollabPlugin.logError("Error persisting collaboration cache", ex);
             }
         });
+        if(!executed) {
+            ArchiCollabPlugin.logTrace("Skipping collaboration cache persist because UI thread is unavailable: reason=" + reason);
+        }
     }
 
     private File resolveCacheFile(String modelId) {
@@ -772,15 +784,14 @@ public class CollabSessionManager {
         }
     }
 
-    private void runOnUiThreadSync(Runnable runnable) {
-        Display display = Display.getDefault();
+    private boolean runOnUiThreadSync(Runnable runnable) {
+        Display display = getDisplay();
         if(display == null || display.isDisposed()) {
-            runnable.run();
-            return;
+            return false;
         }
         if(Thread.currentThread() == display.getThread()) {
             runnable.run();
-            return;
+            return true;
         }
         try {
             display.syncExec(() -> {
@@ -788,10 +799,28 @@ public class CollabSessionManager {
                     runnable.run();
                 }
             });
+            return true;
         }
         catch(SWTException ex) {
             ArchiCollabPlugin.logDebug("Skipping collaboration cache save due to SWT shutdown: " + ex.getMessage());
+            return false;
         }
+    }
+
+    private boolean canPersistCacheSnapshot() {
+        if(!isWorkbenchRunning()) {
+            return false;
+        }
+        Display display = getDisplay();
+        return display != null && !display.isDisposed();
+    }
+
+    protected boolean isWorkbenchRunning() {
+        return PlatformUI.isWorkbenchRunning();
+    }
+
+    protected Display getDisplay() {
+        return Display.getDefault();
     }
 
     private String summarizeEnvelope(String json) {

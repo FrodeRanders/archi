@@ -4,6 +4,7 @@ import com.archimatetool.collab.ArchiCollabPlugin;
 import com.archimatetool.collab.notation.NotationDeserializer;
 import com.archimatetool.collab.util.SimpleJson;
 import com.archimatetool.collab.ws.CollabSessionManager;
+import com.archimatetool.editor.ui.services.EditorManager;
 import com.archimatetool.model.IArchimateConcept;
 import com.archimatetool.model.IArchimateDiagramModel;
 import com.archimatetool.model.IArchimateElement;
@@ -15,6 +16,7 @@ import com.archimatetool.model.IConnectable;
 import com.archimatetool.model.IDocumentable;
 import com.archimatetool.model.IDiagramModelArchimateConnection;
 import com.archimatetool.model.IDiagramModelArchimateObject;
+import com.archimatetool.model.IDiagramModelContainer;
 import com.archimatetool.model.IDiagramModel;
 import com.archimatetool.model.IIdentifier;
 import com.archimatetool.model.INameable;
@@ -459,9 +461,22 @@ public class RemoteOpApplier {
             return false;
         }
         if(eObject instanceof IArchimateConcept concept) {
+            // Delete all diagram components that reference this concept first.
+            // This prevents dangling view objects/connections that later fail model validation on save.
+            List<EObject> referencingComponents = new ArrayList<>();
+            for(var component : concept.getReferencingDiagramComponents()) {
+                if(component instanceof EObject eo) {
+                    referencingComponents.add(eo);
+                }
+            }
+            for(EObject referencing : referencingComponents) {
+                EcoreUtil.delete(referencing, true);
+            }
+
             // Defensive cleanup: ensure no relationship remains with a missing endpoint.
-            for(IArchimateRelationship relationship : ArchimateModelUtils.getAllRelationshipsForConcept(concept)) {
-                EcoreUtil.delete(relationship, true);
+            List<IArchimateRelationship> relationships = new ArrayList<>(ArchimateModelUtils.getAllRelationshipsForConcept(concept));
+            for(IArchimateRelationship relationship : relationships) {
+                deleteRelationshipAndReferences(relationship);
             }
         }
         EcoreUtil.delete(eObject, true);
@@ -554,7 +569,12 @@ public class RemoteOpApplier {
         if(eObject == null) {
             return false;
         }
-        EcoreUtil.delete(eObject, true);
+        if(eObject instanceof IArchimateRelationship relationship) {
+            deleteRelationshipAndReferences(relationship);
+        }
+        else {
+            EcoreUtil.delete(eObject, true);
+        }
         ArchiCollabPlugin.logTrace("Applied DeleteRelationship id=rel:" + relationshipId);
         return true;
     }
@@ -610,6 +630,10 @@ public class RemoteOpApplier {
         if(eObject == null) {
             return false;
         }
+        if(eObject instanceof IDiagramModel diagramModel) {
+            // Keep UI consistent: if a deleted view is open in an editor, close it.
+            EditorManager.closeDiagramEditor(diagramModel);
+        }
         EcoreUtil.delete(eObject, true);
         ArchiCollabPlugin.logTrace("Applied DeleteView id=view:" + viewId);
         return true;
@@ -658,15 +682,32 @@ public class RemoteOpApplier {
             return false;
         }
         if(eObject instanceof IDiagramModelArchimateObject viewObject && viewObject.getArchimateElement() == null) {
-            // On some Archi builds this delete path can trigger UI refresh NPEs for dangling view objects.
-            // Skip explicit deletion; the object is already detached from a concept and will be cleaned up by subsequent sync/snapshot.
-            ArchiCollabPlugin.logTrace("Skipped DeleteViewObject for dangling object id=vo:" + viewObjectId);
+            // Do not keep dangling objects in the model. Remove from parent container if possible.
+            if(viewObject.eContainer() instanceof IDiagramModelContainer container) {
+                container.getChildren().remove(viewObject);
+            }
+            else {
+                EcoreUtil.delete(eObject, true);
+            }
+            viewObjectNotationClocks.remove(viewObjectId);
+            ArchiCollabPlugin.logTrace("Removed dangling view object id=vo:" + viewObjectId);
             return true;
         }
         EcoreUtil.delete(eObject, true);
         viewObjectNotationClocks.remove(viewObjectId);
         ArchiCollabPlugin.logTrace("Applied DeleteViewObject id=vo:" + viewObjectId);
         return true;
+    }
+
+    private void deleteRelationshipAndReferences(IArchimateRelationship relationship) {
+        List<IDiagramModelArchimateConnection> referencingConnections =
+                new ArrayList<>(relationship.getReferencingDiagramConnections());
+        for(IDiagramModelArchimateConnection connection : referencingConnections) {
+            if(connection instanceof EObject eo) {
+                EcoreUtil.delete(eo, true);
+            }
+        }
+        EcoreUtil.delete(relationship, true);
     }
 
     private boolean applyCreateConnection(String opJson) {
