@@ -1,5 +1,8 @@
 package com.archimatetool.collab.ws;
 
+import java.util.ArrayList;
+import java.util.List;
+
 import com.archimatetool.collab.ArchiCollabPlugin;
 import com.archimatetool.collab.emf.RemoteOpApplier;
 import com.archimatetool.collab.util.SimpleJson;
@@ -9,9 +12,11 @@ import com.archimatetool.collab.util.SimpleJson;
  * JSON is handled as raw text for now to keep dependencies minimal.
  */
 public class InboundMessageDispatcher {
+    private static final int MAX_BUFFERED_ENVELOPES = 512;
 
     private final RemoteOpApplier remoteOpApplier;
     private final CollabSessionManager sessionManager;
+    private final List<String> bufferedMutatingEnvelopes = new ArrayList<>();
 
     public InboundMessageDispatcher(CollabSessionManager sessionManager) {
         this.sessionManager = sessionManager;
@@ -28,11 +33,17 @@ public class InboundMessageDispatcher {
         switch(type) {
             case "CheckoutSnapshot":
                 syncRevisionHint(envelopeJson);
+                if(bufferUntilModelAttached(envelopeJson, type)) {
+                    break;
+                }
                 remoteOpApplier.applySnapshotEnvelope(envelopeJson);
                 ArchiCollabPlugin.logInfo("Received checkout payload type=" + type);
                 break;
             case "CheckoutDelta":
                 syncRevisionHint(envelopeJson);
+                if(bufferUntilModelAttached(envelopeJson, type)) {
+                    break;
+                }
                 applyCheckoutDeltaOps(envelopeJson);
                 ArchiCollabPlugin.logInfo("Received checkout payload type=" + type);
                 break;
@@ -41,6 +52,9 @@ public class InboundMessageDispatcher {
                 ArchiCollabPlugin.logInfo("Received OpsAccepted");
                 break;
             case "OpsBroadcast":
+                if(bufferUntilModelAttached(envelopeJson, type)) {
+                    break;
+                }
                 ArchiCollabPlugin.logTrace("Dispatching OpsBroadcast: " + summarizeOpsBroadcast(envelopeJson));
                 remoteOpApplier.applyOpsEnvelope(envelopeJson);
                 break;
@@ -55,6 +69,32 @@ public class InboundMessageDispatcher {
                 ArchiCollabPlugin.logInfo("Unhandled collaboration message type=" + type);
                 break;
         }
+    }
+
+    public synchronized void replayBufferedMutationsIfAny() {
+        if(sessionManager.getAttachedModel() == null || bufferedMutatingEnvelopes.isEmpty()) {
+            return;
+        }
+        List<String> replay = new ArrayList<>(bufferedMutatingEnvelopes);
+        bufferedMutatingEnvelopes.clear();
+        ArchiCollabPlugin.logInfo("Replaying buffered collaboration envelopes count=" + replay.size());
+        for(String envelope : replay) {
+            dispatch(envelope);
+        }
+    }
+
+    private boolean bufferUntilModelAttached(String envelopeJson, String type) {
+        if(sessionManager.getAttachedModel() != null) {
+            return false;
+        }
+        synchronized(this) {
+            if(bufferedMutatingEnvelopes.size() >= MAX_BUFFERED_ENVELOPES) {
+                bufferedMutatingEnvelopes.remove(0);
+            }
+            bufferedMutatingEnvelopes.add(envelopeJson);
+        }
+        ArchiCollabPlugin.logInfo("Buffered collaboration envelope type=" + type + " until model is attached");
+        return true;
     }
 
     private void syncRevisionHint(String envelopeJson) {

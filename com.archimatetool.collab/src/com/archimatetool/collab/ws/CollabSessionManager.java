@@ -1,25 +1,47 @@
 package com.archimatetool.collab.ws;
 
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.WebSocket;
 import java.nio.ByteBuffer;
+import java.nio.file.Path;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Objects;
+import java.util.Properties;
 import java.util.UUID;
+import java.util.Base64;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import com.archimatetool.collab.ArchiCollabPlugin;
 import com.archimatetool.collab.emf.ModelCollaborationController;
 import com.archimatetool.collab.util.SimpleJson;
+import com.archimatetool.editor.model.IEditorModelManager;
 import com.archimatetool.model.IArchimateModel;
+import org.eclipse.swt.SWTException;
+import org.eclipse.swt.widgets.Display;
 
 /**
  * Manages a single websocket collaboration session for now.
  */
 public class CollabSessionManager {
+    private static final long CACHE_SAVE_DEBOUNCE_MS = 2000L;
+    private static final String CACHE_DIR_NAME = "collab-cache";
+    private static final int MAX_OUTBOX_SIZE = 1000;
+    private static final String OUTBOX_FILE_SUFFIX = ".outbox.properties";
+
     public interface SessionStateListener {
         void stateChanged(boolean connected, String modelId);
     }
@@ -37,6 +59,12 @@ public class CollabSessionManager {
     private volatile String userId = "anonymous";
     private volatile String sessionId = "archi-" + UUID.randomUUID();
     private volatile long lastKnownRevision;
+    private volatile boolean serverBackedSession = true;
+    private volatile long lastCacheSaveEpochMillis;
+    private volatile boolean pendingCacheRevisionComparison;
+    private volatile long cacheRevisionAtJoin = -1;
+    private volatile boolean coldSnapshotRebuildRequested;
+    private final Deque<QueuedSubmitOp> offlineOutbox = new ArrayDeque<>();
     private final CopyOnWriteArrayList<SessionStateListener> sessionStateListeners = new CopyOnWriteArrayList<>();
 
     public synchronized void connect(String baseWsUrl, String modelId) {
@@ -48,14 +76,31 @@ public class CollabSessionManager {
         URI uri = URI.create(baseWsUrl + "/models/" + modelId + "/stream");
 
         try {
+            cacheRevisionAtJoin = -1;
+            pendingCacheRevisionComparison = false;
+            coldSnapshotRebuildRequested = false;
+
+            CacheRejoinDecision rejoinDecision = resolveJoinDecision(modelId);
+            if(rejoinDecision.discardCacheProjection()) {
+                discardCacheProjection(rejoinDecision.modelId(), rejoinDecision.reason());
+            }
+            loadOutboxFromDisk(modelId);
+
             webSocket = httpClient.newWebSocketBuilder()
                     .connectTimeout(Duration.ofSeconds(5))
                     .buildAsync(uri, new Listener())
                     .join();
             currentModelId = modelId;
-            sendJoin(lastKnownRevision);
+            Long joinRevision = rejoinDecision.joinRevision();
+            if(joinRevision != null) {
+                cacheRevisionAtJoin = joinRevision;
+                pendingCacheRevisionComparison = true;
+            }
+            sendJoin(joinRevision);
             fireStateChanged(true, modelId);
-            ArchiCollabPlugin.logInfo("Connected collaboration websocket for model " + modelId);
+            ArchiCollabPlugin.logInfo("Connected collaboration websocket for model " + modelId
+                    + " mode=" + (serverBackedSession ? "server-backed" : "local-first")
+                    + " rejoin=" + rejoinDecision.reason());
         }
         catch(Exception ex) {
             ArchiCollabPlugin.logError("Failed to connect collaboration websocket", ex);
@@ -66,6 +111,8 @@ public class CollabSessionManager {
     }
 
     public synchronized void disconnect() {
+        maybePersistCacheSnapshot("disconnect", true);
+
         boolean wasConnected = webSocket != null;
         if(webSocket != null) {
             try {
@@ -83,6 +130,9 @@ public class CollabSessionManager {
 
         webSocket = null;
         currentModelId = null;
+        cacheRevisionAtJoin = -1;
+        pendingCacheRevisionComparison = false;
+        coldSnapshotRebuildRequested = false;
         if(wasConnected) {
             fireStateChanged(false, null);
         }
@@ -108,29 +158,40 @@ public class CollabSessionManager {
     public void attachModel(IArchimateModel model) {
         attachedModel = model;
         modelController.attach(model);
+        inboundMessageDispatcher.replayBufferedMutationsIfAny();
+        maybePersistCacheSnapshot("attach", true);
     }
 
     public void detachModel() {
+        maybePersistCacheSnapshot("detach", true);
         attachedModel = null;
         modelController.detach();
     }
 
-    public void sendJoin(long lastSeenRevision) {
-        String payload = "{" +
-                "\"type\":\"Join\"," +
-                "\"payload\":{" +
-                "\"lastSeenRevision\":" + lastSeenRevision + "," +
-                "\"actor\":{" +
-                "\"userId\":\"" + escape(userId) + "\"," +
-                "\"sessionId\":\"" + escape(sessionId) + "\"" +
-                "}" +
-                "}" +
-                "}";
-        sendRaw(payload);
+    public void sendJoin(Long lastSeenRevision) {
+        StringBuilder payload = new StringBuilder("{");
+        payload.append("\"type\":\"Join\",");
+        payload.append("\"payload\":{");
+        if(lastSeenRevision != null) {
+            payload.append("\"lastSeenRevision\":").append(lastSeenRevision).append(",");
+        }
+        payload.append("\"actor\":{");
+        payload.append("\"userId\":\"").append(escape(userId)).append("\",");
+        payload.append("\"sessionId\":\"").append(escape(sessionId)).append("\"");
+        payload.append("}");
+        payload.append("}");
+        payload.append("}");
+        if(lastSeenRevision == null) {
+            ArchiCollabPlugin.logInfo("Sending Join without lastSeenRevision (cold start snapshot requested)");
+        }
+        else {
+            ArchiCollabPlugin.logTrace("Sending Join with lastSeenRevision=" + lastSeenRevision);
+        }
+        sendRaw(payload.toString());
     }
 
     public void sendSubmitOps(String opBatchJson) {
-        sendRaw(opBatchJson);
+        sendSubmitOpsOrQueue(opBatchJson);
     }
 
     public void sendAcquireLock(String targetsJsonArray, long ttlMs) {
@@ -202,8 +263,19 @@ public class CollabSessionManager {
         return lastKnownRevision;
     }
 
-    public void setLastKnownRevision(long lastKnownRevision) {
-        this.lastKnownRevision = Math.max(lastKnownRevision, this.lastKnownRevision);
+    public synchronized void setLastKnownRevision(long lastKnownRevision) {
+        long normalized = Math.max(0L, lastKnownRevision);
+        evaluateCacheRevisionComparison(normalized);
+        this.lastKnownRevision = Math.max(normalized, this.lastKnownRevision);
+        flushOutboxIfPossible();
+    }
+
+    public boolean isServerBackedSession() {
+        return serverBackedSession;
+    }
+
+    public synchronized void setServerBackedSession(boolean serverBackedSession) {
+        this.serverBackedSession = serverBackedSession;
     }
 
     public void addSessionStateListener(SessionStateListener listener) {
@@ -222,6 +294,104 @@ public class CollabSessionManager {
         for(SessionStateListener listener : sessionStateListeners) {
             listener.stateChanged(connected, modelId);
         }
+    }
+
+    private synchronized void sendSubmitOpsOrQueue(String submitOpsJson) {
+        if(submitOpsJson == null || submitOpsJson.isBlank()) {
+            return;
+        }
+        String modelId = extractModelId(submitOpsJson);
+        if(modelId == null || modelId.isBlank()) {
+            modelId = currentModelId;
+        }
+        if(modelId == null || modelId.isBlank()) {
+            ArchiCollabPlugin.logInfo("Dropping SubmitOps without modelId");
+            return;
+        }
+
+        WebSocket ws = webSocket;
+        if(ws == null) {
+            enqueueOutbox(modelId, submitOpsJson, "websocket-disconnected");
+            return;
+        }
+        sendSubmitOverWebSocket(ws, modelId, submitOpsJson);
+    }
+
+    private void sendSubmitOverWebSocket(WebSocket ws, String modelId, String submitOpsJson) {
+        String rebased = rebaseSubmitOpsBaseRevision(submitOpsJson, lastKnownRevision);
+        ArchiCollabPlugin.logTrace("WS OUT " + summarizeEnvelope(rebased));
+        ws.sendText(rebased, true).exceptionally(ex -> {
+            enqueueOutbox(modelId, submitOpsJson, "send-failed");
+            ArchiCollabPlugin.logInfo("Queued SubmitOps after send failure for modelId=" + modelId + " reason=" + ex.getClass().getSimpleName());
+            return null;
+        });
+    }
+
+    private synchronized void enqueueOutbox(String modelId, String submitOpsJson, String reason) {
+        if(offlineOutbox.size() >= MAX_OUTBOX_SIZE) {
+            QueuedSubmitOp dropped = offlineOutbox.removeFirst();
+            ArchiCollabPlugin.logInfo("Outbox full; dropping oldest queued SubmitOps modelId=" + dropped.modelId);
+            persistOutboxToDisk(dropped.modelId);
+        }
+        offlineOutbox.addLast(new QueuedSubmitOp(modelId, submitOpsJson, System.currentTimeMillis()));
+        persistOutboxToDisk(modelId);
+        ArchiCollabPlugin.logInfo("Queued SubmitOps for offline replay modelId=" + modelId
+                + " queueSize=" + offlineOutbox.size()
+                + " reason=" + reason);
+    }
+
+    private synchronized void flushOutboxIfPossible() {
+        if(offlineOutbox.isEmpty()) {
+            return;
+        }
+        WebSocket ws = webSocket;
+        if(ws == null) {
+            return;
+        }
+        if(currentModelId == null || currentModelId.isBlank()) {
+            return;
+        }
+        if(lastKnownRevision < 0) {
+            return;
+        }
+
+        List<QueuedSubmitOp> replay = new ArrayList<>();
+        Deque<QueuedSubmitOp> remainder = new ArrayDeque<>();
+        while(!offlineOutbox.isEmpty()) {
+            QueuedSubmitOp queued = offlineOutbox.removeFirst();
+            if(currentModelId.equals(queued.modelId)) {
+                replay.add(queued);
+            }
+            else {
+                remainder.addLast(queued);
+            }
+        }
+        offlineOutbox.addAll(remainder);
+        persistOutboxToDisk(currentModelId);
+        if(replay.isEmpty()) {
+            return;
+        }
+
+        ArchiCollabPlugin.logInfo("Replaying queued offline ops modelId=" + currentModelId
+                + " queuedCount=" + replay.size()
+                + " rebaseRevision=" + lastKnownRevision);
+        for(QueuedSubmitOp queued : replay) {
+            sendSubmitOverWebSocket(ws, queued.modelId, queued.submitOpsJson);
+        }
+    }
+
+    private String extractModelId(String submitOpsJson) {
+        String payload = SimpleJson.asJsonObject(SimpleJson.readRawField(submitOpsJson, "payload"));
+        return payload == null ? null : SimpleJson.readStringField(payload, "modelId");
+    }
+
+    private String rebaseSubmitOpsBaseRevision(String submitOpsJson, long revision) {
+        Pattern pattern = Pattern.compile("(\\\"baseRevision\\\"\\s*:\\s*)\\d+");
+        Matcher matcher = pattern.matcher(submitOpsJson);
+        if(!matcher.find()) {
+            return submitOpsJson;
+        }
+        return matcher.replaceFirst(Matcher.quoteReplacement(matcher.group(1) + Math.max(0L, revision)));
     }
 
     private void sendRaw(String payload) {
@@ -263,6 +433,13 @@ public class CollabSessionManager {
                     }
                 }
                 inboundMessageDispatcher.dispatch(message);
+                String type = SimpleJson.readStringField(message, "type");
+                if("CheckoutSnapshot".equals(type)
+                        || "CheckoutDelta".equals(type)
+                        || "OpsBroadcast".equals(type)
+                        || "OpsAccepted".equals(type)) {
+                    maybePersistCacheSnapshot(type, false);
+                }
                 fragments.setLength(0);
             }
             webSocket.request(1);
@@ -278,6 +455,342 @@ public class CollabSessionManager {
         @Override
         public void onError(WebSocket webSocket, Throwable error) {
             ArchiCollabPlugin.logError("Collaboration websocket listener error", error);
+        }
+
+        @Override
+        public CompletionStage<?> onClose(WebSocket webSocket, int statusCode, String reason) {
+            synchronized(CollabSessionManager.this) {
+                if(CollabSessionManager.this.webSocket == webSocket) {
+                    CollabSessionManager.this.webSocket = null;
+                }
+            }
+            fireStateChanged(false, currentModelId);
+            ArchiCollabPlugin.logInfo("Collaboration websocket closed statusCode=" + statusCode + " reason=" + reason);
+            return CompletableFuture.completedFuture(null);
+        }
+    }
+
+    private CacheRejoinDecision resolveJoinDecision(String modelId) {
+        if(serverBackedSession) {
+            CacheMetadata metadata = readCacheMetadata(modelId);
+            if(metadata == null) {
+                return new CacheRejoinDecision(modelId, null, false, "no-cache-metadata");
+            }
+            if(!metadata.serverBacked) {
+                return new CacheRejoinDecision(modelId, null, true, "cache-not-server-backed");
+            }
+            if(!Objects.equals(modelId, metadata.modelId)) {
+                return new CacheRejoinDecision(modelId, null, true, "cache-modelId-mismatch");
+            }
+            if(!metadata.cacheFile.exists()) {
+                return new CacheRejoinDecision(modelId, null, true, "cache-file-missing");
+            }
+            if(metadata.revision < 0) {
+                return new CacheRejoinDecision(modelId, null, true, "cache-revision-unknown");
+            }
+            return new CacheRejoinDecision(modelId, metadata.revision, false, "cache-revision-rejoin");
+        }
+        return new CacheRejoinDecision(modelId, lastKnownRevision, false, "local-lastKnownRevision");
+    }
+
+    private void evaluateCacheRevisionComparison(long serverRevision) {
+        if(!pendingCacheRevisionComparison) {
+            return;
+        }
+        pendingCacheRevisionComparison = false;
+
+        if(cacheRevisionAtJoin < 0) {
+            return;
+        }
+        if(serverRevision > cacheRevisionAtJoin) {
+            ArchiCollabPlugin.logInfo("Cache stale on reconnect: cacheRevision=" + cacheRevisionAtJoin
+                    + " serverRevision=" + serverRevision + " (delta/snapshot refresh expected)");
+            return;
+        }
+        if(serverRevision == cacheRevisionAtJoin) {
+            ArchiCollabPlugin.logTrace("Cache revision matches server head on reconnect: revision=" + serverRevision);
+            return;
+        }
+
+        ArchiCollabPlugin.logInfo("Cache revision inconsistent with server head: cacheRevision="
+                + cacheRevisionAtJoin + " serverRevision=" + serverRevision
+                + " (requesting cold snapshot rebuild)");
+        requestColdSnapshotRebuild();
+    }
+
+    private synchronized void requestColdSnapshotRebuild() {
+        if(coldSnapshotRebuildRequested) {
+            return;
+        }
+        if(webSocket == null) {
+            return;
+        }
+        coldSnapshotRebuildRequested = true;
+        sendJoin(null);
+    }
+
+    private void maybePersistCacheSnapshot(String reason, boolean force) {
+        if(!serverBackedSession) {
+            return;
+        }
+        IArchimateModel model = attachedModel;
+        String modelId = currentModelId;
+        if(model == null || modelId == null || modelId.isBlank()) {
+            return;
+        }
+
+        long now = System.currentTimeMillis();
+        if(!force && now - lastCacheSaveEpochMillis < CACHE_SAVE_DEBOUNCE_MS) {
+            return;
+        }
+
+        runOnUiThreadSync(() -> {
+            try {
+                File cacheFile = resolveCacheFile(modelId);
+                if(cacheFile == null) {
+                    return;
+                }
+
+                File parent = cacheFile.getParentFile();
+                if(parent != null && !parent.exists() && !parent.mkdirs()) {
+                    ArchiCollabPlugin.logDebug("Could not create collaboration cache directory: " + parent);
+                    return;
+                }
+
+                if(model.getFile() == null || !cacheFile.equals(model.getFile())) {
+                    model.setFile(cacheFile);
+                }
+
+                boolean dirty = IEditorModelManager.INSTANCE.isModelDirty(model);
+                if(dirty || force) {
+                    IEditorModelManager.INSTANCE.saveModel(model);
+                }
+                writeCacheMetadata(cacheFile, modelId, lastKnownRevision);
+                lastCacheSaveEpochMillis = System.currentTimeMillis();
+                ArchiCollabPlugin.logTrace("Collaboration cache persisted reason=" + reason
+                        + " modelId=" + modelId + " revision=" + lastKnownRevision + " dirty=" + dirty);
+            }
+            catch(Exception ex) {
+                ArchiCollabPlugin.logError("Error persisting collaboration cache", ex);
+            }
+        });
+    }
+
+    private File resolveCacheFile(String modelId) {
+        String safeModelId = sanitizeModelIdForFileName(modelId);
+        if(safeModelId.isBlank()) {
+            return null;
+        }
+        String userHome = System.getProperty("user.home", "");
+        if(userHome.isBlank()) {
+            return null;
+        }
+        Path path = Path.of(userHome, "Archi", CACHE_DIR_NAME, safeModelId + ".archimate");
+        return path.toFile();
+    }
+
+    private String sanitizeModelIdForFileName(String modelId) {
+        return modelId == null ? "" : modelId.replaceAll("[^a-zA-Z0-9._-]", "_");
+    }
+
+    private void writeCacheMetadata(File cacheFile, String modelId, long revision) throws IOException {
+        if(cacheFile == null) {
+            return;
+        }
+        File metadataFile = new File(cacheFile.getParentFile(), cacheFile.getName() + ".meta.properties");
+        Properties properties = new Properties();
+        properties.setProperty("modelId", modelId == null ? "" : modelId);
+        properties.setProperty("lastKnownRevision", String.valueOf(revision));
+        properties.setProperty("serverBacked", String.valueOf(serverBackedSession));
+        properties.setProperty("savedAtEpochMs", String.valueOf(System.currentTimeMillis()));
+        try(FileOutputStream outputStream = new FileOutputStream(metadataFile)) {
+            properties.store(outputStream, "Archi collaboration cache metadata");
+        }
+    }
+
+    private CacheMetadata readCacheMetadata(String modelId) {
+        File cacheFile = resolveCacheFile(modelId);
+        if(cacheFile == null) {
+            return null;
+        }
+        File metadataFile = new File(cacheFile.getParentFile(), cacheFile.getName() + ".meta.properties");
+        if(!metadataFile.exists()) {
+            return null;
+        }
+
+        Properties properties = new Properties();
+        try(FileInputStream inputStream = new FileInputStream(metadataFile)) {
+            properties.load(inputStream);
+        }
+        catch(IOException ex) {
+            ArchiCollabPlugin.logInfo("Failed reading collaboration cache metadata, forcing snapshot rebuild: " + ex.getMessage());
+            return new CacheMetadata(cacheFile, metadataFile, modelId, -1L, false);
+        }
+
+        String metadataModelId = properties.getProperty("modelId", "");
+        long metadataRevision = parseLong(properties.getProperty("lastKnownRevision"), -1L);
+        boolean metadataServerBacked = Boolean.parseBoolean(properties.getProperty("serverBacked", "false"));
+        return new CacheMetadata(cacheFile, metadataFile, metadataModelId, metadataRevision, metadataServerBacked);
+    }
+
+    private long parseLong(String value, long fallback) {
+        if(value == null || value.isBlank()) {
+            return fallback;
+        }
+        try {
+            return Long.parseLong(value);
+        }
+        catch(NumberFormatException ex) {
+            return fallback;
+        }
+    }
+
+    private void discardCacheProjection(String modelId, String reason) {
+        File cacheFile = resolveCacheFile(modelId);
+        if(cacheFile == null) {
+            return;
+        }
+        File metadataFile = new File(cacheFile.getParentFile(), cacheFile.getName() + ".meta.properties");
+        File outboxFile = resolveOutboxFile(modelId);
+        boolean removedCache = !cacheFile.exists() || cacheFile.delete();
+        boolean removedMetadata = !metadataFile.exists() || metadataFile.delete();
+        boolean removedOutbox = outboxFile == null || !outboxFile.exists() || outboxFile.delete();
+        ArchiCollabPlugin.logInfo("Discarded collaboration cache projection reason=" + reason
+                + " modelId=" + modelId
+                + " cacheDeleted=" + removedCache
+                + " metadataDeleted=" + removedMetadata
+                + " outboxDeleted=" + removedOutbox);
+    }
+
+    private synchronized void loadOutboxFromDisk(String modelId) {
+        File outboxFile = resolveOutboxFile(modelId);
+        if(outboxFile == null || !outboxFile.exists()) {
+            return;
+        }
+        // Prevent duplicates on reconnect by clearing in-memory entries for this model first.
+        offlineOutbox.removeIf(queued -> modelId.equals(queued.modelId));
+
+        Properties properties = new Properties();
+        try(FileInputStream inputStream = new FileInputStream(outboxFile)) {
+            properties.load(inputStream);
+        }
+        catch(IOException ex) {
+            ArchiCollabPlugin.logInfo("Could not read durable outbox for modelId=" + modelId + " reason=" + ex.getMessage());
+            return;
+        }
+
+        int count = (int)parseLong(properties.getProperty("count"), 0L);
+        if(count <= 0) {
+            return;
+        }
+
+        int loaded = 0;
+        for(int i = 0; i < count; i++) {
+            String encoded = properties.getProperty("item." + i + ".payload");
+            if(encoded == null || encoded.isBlank()) {
+                continue;
+            }
+            String json = decodeBase64Utf8(encoded);
+            if(json == null || json.isBlank()) {
+                continue;
+            }
+            long queuedAt = parseLong(properties.getProperty("item." + i + ".queuedAtEpochMs"), System.currentTimeMillis());
+            if(offlineOutbox.size() >= MAX_OUTBOX_SIZE) {
+                offlineOutbox.removeFirst();
+            }
+            offlineOutbox.addLast(new QueuedSubmitOp(modelId, json, queuedAt));
+            loaded++;
+        }
+
+        if(loaded > 0) {
+            ArchiCollabPlugin.logInfo("Loaded durable outbox entries modelId=" + modelId + " count=" + loaded);
+        }
+    }
+
+    private synchronized void persistOutboxToDisk(String modelId) {
+        File outboxFile = resolveOutboxFile(modelId);
+        if(outboxFile == null) {
+            return;
+        }
+        File parent = outboxFile.getParentFile();
+        if(parent != null && !parent.exists() && !parent.mkdirs()) {
+            ArchiCollabPlugin.logDebug("Could not create outbox directory: " + parent);
+            return;
+        }
+
+        List<QueuedSubmitOp> modelEntries = new ArrayList<>();
+        for(QueuedSubmitOp queued : offlineOutbox) {
+            if(modelId.equals(queued.modelId)) {
+                modelEntries.add(queued);
+            }
+        }
+        if(modelEntries.isEmpty()) {
+            if(outboxFile.exists() && !outboxFile.delete()) {
+                ArchiCollabPlugin.logDebug("Could not delete empty durable outbox file: " + outboxFile);
+            }
+            return;
+        }
+
+        Properties properties = new Properties();
+        properties.setProperty("modelId", modelId);
+        properties.setProperty("count", String.valueOf(modelEntries.size()));
+        for(int i = 0; i < modelEntries.size(); i++) {
+            QueuedSubmitOp queued = modelEntries.get(i);
+            properties.setProperty("item." + i + ".queuedAtEpochMs", String.valueOf(queued.queuedAtEpochMs));
+            properties.setProperty("item." + i + ".payload", encodeBase64Utf8(queued.submitOpsJson));
+        }
+        try(FileOutputStream outputStream = new FileOutputStream(outboxFile)) {
+            properties.store(outputStream, "Archi collaboration durable outbox");
+        }
+        catch(IOException ex) {
+            ArchiCollabPlugin.logInfo("Could not persist durable outbox for modelId=" + modelId + " reason=" + ex.getMessage());
+        }
+    }
+
+    private File resolveOutboxFile(String modelId) {
+        File cacheFile = resolveCacheFile(modelId);
+        if(cacheFile == null) {
+            return null;
+        }
+        return new File(cacheFile.getParentFile(), cacheFile.getName() + OUTBOX_FILE_SUFFIX);
+    }
+
+    private String encodeBase64Utf8(String value) {
+        if(value == null) {
+            return "";
+        }
+        return Base64.getEncoder().encodeToString(value.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private String decodeBase64Utf8(String value) {
+        try {
+            byte[] decoded = Base64.getDecoder().decode(value);
+            return new String(decoded, StandardCharsets.UTF_8);
+        }
+        catch(IllegalArgumentException ex) {
+            return null;
+        }
+    }
+
+    private void runOnUiThreadSync(Runnable runnable) {
+        Display display = Display.getDefault();
+        if(display == null || display.isDisposed()) {
+            runnable.run();
+            return;
+        }
+        if(Thread.currentThread() == display.getThread()) {
+            runnable.run();
+            return;
+        }
+        try {
+            display.syncExec(() -> {
+                if(!display.isDisposed()) {
+                    runnable.run();
+                }
+            });
+        }
+        catch(SWTException ex) {
+            ArchiCollabPlugin.logDebug("Skipping collaboration cache save due to SWT shutdown: " + ex.getMessage());
         }
     }
 
@@ -311,5 +824,26 @@ public class CollabSessionManager {
             summary.append(" opBatchId=").append(opBatchId).append(" opCount=").append(opCount);
         }
         return summary.toString();
+    }
+
+    private record CacheMetadata(
+            File cacheFile,
+            File metadataFile,
+            String modelId,
+            long revision,
+            boolean serverBacked) {
+    }
+
+    private record CacheRejoinDecision(
+            String modelId,
+            Long joinRevision,
+            boolean discardCacheProjection,
+            String reason) {
+    }
+
+    private record QueuedSubmitOp(
+            String modelId,
+            String submitOpsJson,
+            long queuedAtEpochMs) {
     }
 }

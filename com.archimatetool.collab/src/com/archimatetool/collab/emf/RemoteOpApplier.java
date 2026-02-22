@@ -28,8 +28,12 @@ import org.eclipse.emf.ecore.util.EcoreUtil;
 import org.eclipse.swt.widgets.Display;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Applies remote operations into the local EMF model.
@@ -44,6 +48,8 @@ public class RemoteOpApplier {
     private final CollabSessionManager sessionManager;
     private final NotationDeserializer notationDeserializer = new NotationDeserializer();
     private final List<DeferredOp> deferredOps = new ArrayList<>();
+    private final Map<String, FieldClock> viewObjectNotationClocks = new HashMap<>();
+    private final Map<String, FieldClock> connectionNotationClocks = new HashMap<>();
     private boolean deferredRetryScheduled;
 
     public RemoteOpApplier(CollabSessionManager sessionManager) {
@@ -168,6 +174,8 @@ public class RemoteOpApplier {
         return switch(type) {
             case "CreateViewObject" -> shouldDeferCreateViewObject(opJson);
             case "CreateConnection" -> shouldDeferCreateConnection(opJson);
+            case "CreateRelationship" -> shouldDeferCreateRelationship(opJson);
+            case "UpdateRelationship" -> shouldDeferUpdateRelationship(opJson);
             case "UpdateViewObjectOpaque" -> shouldDeferViewObjectOpaque(opJson);
             case "UpdateConnectionOpaque" -> shouldDeferConnectionOpaque(opJson);
             default -> false;
@@ -183,9 +191,9 @@ public class RemoteOpApplier {
         if(viewObjectId == null || findObjectById(viewObjectId) != null) {
             return false;
         }
-        EObject viewEObject = findPrefixedObject(SimpleJson.readStringField(viewObjectJson, "viewId"));
+        IDiagramModel view = resolveViewForOp(SimpleJson.readStringField(viewObjectJson, "viewId"), false);
         EObject representsEObject = findPrefixedObject(SimpleJson.readStringField(viewObjectJson, "representsId"));
-        return !(viewEObject instanceof IDiagramModel) || !(representsEObject instanceof IArchimateElement);
+        return view == null || !(representsEObject instanceof IArchimateElement);
     }
 
     private boolean shouldDeferCreateConnection(String opJson) {
@@ -197,14 +205,57 @@ public class RemoteOpApplier {
         if(connectionId == null || findObjectById(connectionId) != null) {
             return false;
         }
-        EObject viewEObject = findPrefixedObject(SimpleJson.readStringField(connectionJson, "viewId"));
+        IDiagramModel view = resolveViewForOp(SimpleJson.readStringField(connectionJson, "viewId"), false);
         EObject representsEObject = findPrefixedObject(SimpleJson.readStringField(connectionJson, "representsId"));
         EObject sourceEObject = findPrefixedObject(SimpleJson.readStringField(connectionJson, "sourceViewObjectId"));
         EObject targetEObject = findPrefixedObject(SimpleJson.readStringField(connectionJson, "targetViewObjectId"));
-        return !(viewEObject instanceof IDiagramModel)
+        return view == null
                 || !(representsEObject instanceof IArchimateRelationship)
                 || !(sourceEObject instanceof IConnectable)
                 || !(targetEObject instanceof IConnectable);
+    }
+
+    private boolean shouldDeferCreateRelationship(String opJson) {
+        String relationshipJson = SimpleJson.asJsonObject(SimpleJson.readRawField(opJson, "relationship"));
+        if(relationshipJson == null) {
+            return false;
+        }
+
+        String relationshipId = stripPrefix(SimpleJson.readStringField(relationshipJson, "id"), "rel:");
+        if(relationshipId == null || findObjectById(relationshipId) != null) {
+            return false;
+        }
+
+        EObject sourceEObject = findPrefixedObject(SimpleJson.readStringField(relationshipJson, "sourceId"));
+        EObject targetEObject = findPrefixedObject(SimpleJson.readStringField(relationshipJson, "targetId"));
+        return !(sourceEObject instanceof IArchimateConcept) || !(targetEObject instanceof IArchimateConcept);
+    }
+
+    private boolean shouldDeferUpdateRelationship(String opJson) {
+        String relationshipId = stripPrefix(SimpleJson.readStringField(opJson, "relationshipId"), "rel:");
+        EObject relationshipEObject = relationshipId == null ? null : findObjectById(relationshipId);
+        if(!(relationshipEObject instanceof IArchimateRelationship)) {
+            return relationshipId != null;
+        }
+
+        String patchJson = SimpleJson.asJsonObject(SimpleJson.readRawField(opJson, "patch"));
+        if(patchJson == null) {
+            return false;
+        }
+
+        if(SimpleJson.hasField(patchJson, "sourceId")) {
+            EObject sourceEObject = findPrefixedObject(SimpleJson.readStringField(patchJson, "sourceId"));
+            if(!(sourceEObject instanceof IArchimateConcept)) {
+                return true;
+            }
+        }
+        if(SimpleJson.hasField(patchJson, "targetId")) {
+            EObject targetEObject = findPrefixedObject(SimpleJson.readStringField(patchJson, "targetId"));
+            if(!(targetEObject instanceof IArchimateConcept)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private boolean shouldDeferViewObjectOpaque(String opJson) {
@@ -407,6 +458,12 @@ public class RemoteOpApplier {
         if(eObject == null) {
             return false;
         }
+        if(eObject instanceof IArchimateConcept concept) {
+            // Defensive cleanup: ensure no relationship remains with a missing endpoint.
+            for(IArchimateRelationship relationship : ArchimateModelUtils.getAllRelationshipsForConcept(concept)) {
+                EcoreUtil.delete(relationship, true);
+            }
+        }
         EcoreUtil.delete(eObject, true);
         ArchiCollabPlugin.logTrace("Applied DeleteElement id=elem:" + elementId);
         return true;
@@ -441,12 +498,11 @@ public class RemoteOpApplier {
 
         EObject source = findPrefixedObject(SimpleJson.readStringField(relationshipJson, "sourceId"));
         EObject target = findPrefixedObject(SimpleJson.readStringField(relationshipJson, "targetId"));
-        if(source instanceof IArchimateConcept sourceConcept) {
-            relationship.setSource(sourceConcept);
+        if(!(source instanceof IArchimateConcept sourceConcept) || !(target instanceof IArchimateConcept targetConcept)) {
+            return false;
         }
-        if(target instanceof IArchimateConcept targetConcept) {
-            relationship.setTarget(targetConcept);
-        }
+        relationship.setSource(sourceConcept);
+        relationship.setTarget(targetConcept);
 
         IArchimateModel model = sessionManager.getAttachedModel();
         if(model == null) {
@@ -472,14 +528,22 @@ public class RemoteOpApplier {
             setIfPresentDocumentation(documentable, patchJson, "documentation");
         }
 
-        EObject source = findPrefixedObject(SimpleJson.readStringField(patchJson, "sourceId"));
-        EObject target = findPrefixedObject(SimpleJson.readStringField(patchJson, "targetId"));
-        if(source instanceof IArchimateConcept sourceConcept) {
+        if(SimpleJson.hasField(patchJson, "sourceId")) {
+            EObject source = findPrefixedObject(SimpleJson.readStringField(patchJson, "sourceId"));
+            if(!(source instanceof IArchimateConcept sourceConcept)) {
+                return false;
+            }
             relationship.setSource(sourceConcept);
         }
-        if(target instanceof IArchimateConcept targetConcept) {
+
+        if(SimpleJson.hasField(patchJson, "targetId")) {
+            EObject target = findPrefixedObject(SimpleJson.readStringField(patchJson, "targetId"));
+            if(!(target instanceof IArchimateConcept targetConcept)) {
+                return false;
+            }
             relationship.setTarget(targetConcept);
         }
+
         ArchiCollabPlugin.logTrace("Applied UpdateRelationship id=rel:" + relationshipId + " patch=" + summarizePatch(patchJson));
         return true;
     }
@@ -562,9 +626,9 @@ public class RemoteOpApplier {
             return false;
         }
 
-        EObject viewEObject = findPrefixedObject(SimpleJson.readStringField(viewObjectJson, "viewId"));
+        IDiagramModel view = resolveViewForOp(SimpleJson.readStringField(viewObjectJson, "viewId"), true);
         EObject representsEObject = findPrefixedObject(SimpleJson.readStringField(viewObjectJson, "representsId"));
-        if(!(viewEObject instanceof IDiagramModel view) || !(representsEObject instanceof IArchimateElement archimateElement)) {
+        if(view == null || !(representsEObject instanceof IArchimateElement archimateElement)) {
             return false;
         }
 
@@ -575,6 +639,7 @@ public class RemoteOpApplier {
         String notationJson = SimpleJson.asJsonObject(SimpleJson.readRawField(viewObjectJson, "notationJson"));
         if(notationJson != null) {
             notationDeserializer.applyViewObjectNotation(viewObject, notationJson);
+            seedGeometryClock(viewObjectId, notationJson, opJson);
         }
         // Archi edit parts expect bounds to be non-null when the object is added to the view.
         if(viewObject.getBounds() == null) {
@@ -592,7 +657,14 @@ public class RemoteOpApplier {
         if(eObject == null) {
             return false;
         }
+        if(eObject instanceof IDiagramModelArchimateObject viewObject && viewObject.getArchimateElement() == null) {
+            // On some Archi builds this delete path can trigger UI refresh NPEs for dangling view objects.
+            // Skip explicit deletion; the object is already detached from a concept and will be cleaned up by subsequent sync/snapshot.
+            ArchiCollabPlugin.logTrace("Skipped DeleteViewObject for dangling object id=vo:" + viewObjectId);
+            return true;
+        }
         EcoreUtil.delete(eObject, true);
+        viewObjectNotationClocks.remove(viewObjectId);
         ArchiCollabPlugin.logTrace("Applied DeleteViewObject id=vo:" + viewObjectId);
         return true;
     }
@@ -608,11 +680,11 @@ public class RemoteOpApplier {
             return false;
         }
 
-        EObject viewEObject = findPrefixedObject(SimpleJson.readStringField(connectionJson, "viewId"));
+        IDiagramModel view = resolveViewForOp(SimpleJson.readStringField(connectionJson, "viewId"), true);
         EObject representsEObject = findPrefixedObject(SimpleJson.readStringField(connectionJson, "representsId"));
         EObject sourceEObject = findPrefixedObject(SimpleJson.readStringField(connectionJson, "sourceViewObjectId"));
         EObject targetEObject = findPrefixedObject(SimpleJson.readStringField(connectionJson, "targetViewObjectId"));
-        if(!(viewEObject instanceof IDiagramModel)
+        if(view == null
                 || !(representsEObject instanceof IArchimateRelationship relationship)
                 || !(sourceEObject instanceof IConnectable source)
                 || !(targetEObject instanceof IConnectable target)) {
@@ -627,6 +699,7 @@ public class RemoteOpApplier {
         String notationJson = SimpleJson.asJsonObject(SimpleJson.readRawField(connectionJson, "notationJson"));
         if(notationJson != null) {
             notationDeserializer.applyConnectionNotation(connection, notationJson);
+            seedConnectionClock(connectionId, notationJson, opJson);
         }
         ArchiCollabPlugin.logTrace("Applied CreateConnection id=conn:" + connectionId + " represents=" + SimpleJson.readStringField(connectionJson, "representsId"));
         return true;
@@ -639,6 +712,7 @@ public class RemoteOpApplier {
             return false;
         }
         EcoreUtil.delete(eObject, true);
+        connectionNotationClocks.remove(connectionId);
         ArchiCollabPlugin.logTrace("Applied DeleteConnection id=conn:" + connectionId);
         return true;
     }
@@ -708,7 +782,8 @@ public class RemoteOpApplier {
         if(!(eObject instanceof IDiagramModelArchimateObject viewObject)) {
             return false;
         }
-        notationDeserializer.applyViewObjectNotation(viewObject, notationJson);
+        String effectiveNotation = applyViewObjectNotationLww(viewObjectId, viewObject, notationJson, opJson);
+        notationDeserializer.applyViewObjectNotation(viewObject, effectiveNotation);
         ArchiCollabPlugin.logTrace("Applied UpdateViewObjectOpaque id=vo:" + viewObjectId);
         return true;
     }
@@ -724,7 +799,8 @@ public class RemoteOpApplier {
         if(!(eObject instanceof IDiagramModelArchimateConnection connection)) {
             return false;
         }
-        notationDeserializer.applyConnectionNotation(connection, notationJson);
+        String effectiveNotation = applyConnectionNotationLww(connectionId, connection, notationJson, opJson);
+        notationDeserializer.applyConnectionNotation(connection, effectiveNotation);
         ArchiCollabPlugin.logTrace("Applied UpdateConnectionOpaque id=conn:" + connectionId);
         return true;
     }
@@ -732,6 +808,63 @@ public class RemoteOpApplier {
     private EObject findObjectById(String id) {
         IArchimateModel model = sessionManager.getAttachedModel();
         return ArchimateModelUtils.getObjectByID(model, id);
+    }
+
+    private IDiagramModel resolveViewForOp(String prefixedViewId, boolean reconcileId) {
+        EObject direct = findPrefixedObject(prefixedViewId);
+        if(direct instanceof IDiagramModel diagramModel) {
+            return diagramModel;
+        }
+
+        IArchimateModel model = sessionManager.getAttachedModel();
+        if(model == null) {
+            return null;
+        }
+
+        List<IDiagramModel> candidates = new ArrayList<>();
+        for(var it = model.eAllContents(); it.hasNext();) {
+            EObject object = it.next();
+            if(object instanceof IDiagramModel diagramModel) {
+                candidates.add(diagramModel);
+            }
+        }
+        if(candidates.isEmpty()) {
+            return null;
+        }
+
+        IDiagramModel candidate = null;
+        if(candidates.size() == 1) {
+            candidate = candidates.get(0);
+        }
+        else {
+            IDiagramModel defaultViewCandidate = null;
+            for(IDiagramModel view : candidates) {
+                if(view instanceof INameable nameable && "Default View".equals(nameable.getName())) {
+                    if(defaultViewCandidate != null) {
+                        defaultViewCandidate = null;
+                        break;
+                    }
+                    defaultViewCandidate = view;
+                }
+            }
+            candidate = defaultViewCandidate;
+        }
+        if(candidate == null) {
+            return null;
+        }
+
+        if(reconcileId && candidate instanceof IIdentifier identifier) {
+            String targetId = stripPrefix(prefixedViewId, "view:");
+            if(targetId != null
+                    && !targetId.isBlank()
+                    && !targetId.equals(identifier.getId())
+                    && findObjectById(targetId) == null) {
+                String oldId = identifier.getId();
+                identifier.setId(targetId);
+                ArchiCollabPlugin.logInfo("Reconciled local view identity old=view:" + oldId + " new=view:" + targetId);
+            }
+        }
+        return candidate;
     }
 
     private EObject findPrefixedObject(String prefixedId) {
@@ -781,6 +914,10 @@ public class RemoteOpApplier {
 
     private String getName(Object object) {
         return object instanceof INameable nameable ? nameable.getName() : "";
+    }
+
+    private String getDocumentation(Object object) {
+        return object instanceof IDocumentable documentable ? documentable.getDocumentation() : "";
     }
 
     private String summarizePatch(String patchJson) {
@@ -835,6 +972,8 @@ public class RemoteOpApplier {
     }
 
     private void clearModelContents(IArchimateModel model) {
+        viewObjectNotationClocks.clear();
+        connectionNotationClocks.clear();
         List<EObject> views = new ArrayList<>();
         List<EObject> concepts = new ArrayList<>();
 
@@ -856,6 +995,275 @@ public class RemoteOpApplier {
         for(EObject concept : concepts) {
             EcoreUtil.delete(concept, true);
         }
+    }
+
+    private void seedGeometryClock(String viewObjectId, String notationJson, String opJson) {
+        FieldClock clock = viewObjectNotationClocks.computeIfAbsent(viewObjectId, id -> new FieldClock());
+        CausalClock incoming = parseCausal(opJson);
+        seedClockFromNotation(clock, notationJson, incoming);
+    }
+
+    private void seedConnectionClock(String connectionId, String notationJson, String opJson) {
+        FieldClock clock = connectionNotationClocks.computeIfAbsent(connectionId, id -> new FieldClock());
+        CausalClock incoming = parseCausal(opJson);
+        seedClockFromNotation(clock, notationJson, incoming);
+    }
+
+    private void seedClockFromNotation(FieldClock clock, String notationJson, CausalClock incoming) {
+        for(String field : extractNotationFields(notationJson)) {
+            clock.set(field, incoming);
+        }
+    }
+
+    private String applyViewObjectNotationLww(String viewObjectId,
+                                              IDiagramModelArchimateObject viewObject,
+                                              String notationJson,
+                                              String opJson) {
+        FieldClock clock = viewObjectNotationClocks.computeIfAbsent(viewObjectId, id -> new FieldClock());
+        CausalClock incoming = parseCausal(opJson);
+        String rewritten = notationJson;
+
+        if(viewObject.getBounds() != null) {
+            rewritten = mergeNumberField("x", viewObject.getBounds().getX(), rewritten, incoming, clock);
+            rewritten = mergeNumberField("y", viewObject.getBounds().getY(), rewritten, incoming, clock);
+            rewritten = mergeNumberField("width", viewObject.getBounds().getWidth(), rewritten, incoming, clock);
+            rewritten = mergeNumberField("height", viewObject.getBounds().getHeight(), rewritten, incoming, clock);
+        }
+        rewritten = mergeNumberField("type", viewObject.getType(), rewritten, incoming, clock);
+        rewritten = mergeNumberField("alpha", viewObject.getAlpha(), rewritten, incoming, clock);
+        rewritten = mergeNumberField("lineAlpha", viewObject.getLineAlpha(), rewritten, incoming, clock);
+        rewritten = mergeNumberField("lineWidth", viewObject.getLineWidth(), rewritten, incoming, clock);
+        rewritten = mergeNumberField("lineStyle", viewObject.getLineStyle(), rewritten, incoming, clock);
+        rewritten = mergeNumberField("textAlignment", viewObject.getTextAlignment(), rewritten, incoming, clock);
+        rewritten = mergeNumberField("textPosition", viewObject.getTextPosition(), rewritten, incoming, clock);
+        rewritten = mergeNumberField("gradient", viewObject.getGradient(), rewritten, incoming, clock);
+        rewritten = mergeNumberField("iconVisibleState", viewObject.getIconVisibleState(), rewritten, incoming, clock);
+        rewritten = mergeBooleanField("deriveElementLineColor", viewObject.getDeriveElementLineColor(), rewritten, incoming, clock);
+        rewritten = mergeStringField("fillColor", viewObject.getFillColor(), rewritten, incoming, clock);
+        rewritten = mergeStringField("lineColor", viewObject.getLineColor(), rewritten, incoming, clock);
+        rewritten = mergeStringField("font", viewObject.getFont(), rewritten, incoming, clock);
+        rewritten = mergeStringField("fontColor", viewObject.getFontColor(), rewritten, incoming, clock);
+        rewritten = mergeStringField("iconColor", viewObject.getIconColor(), rewritten, incoming, clock);
+        if(viewObject instanceof com.archimatetool.model.IIconic iconic) {
+            rewritten = mergeStringField("imagePath", iconic.getImagePath(), rewritten, incoming, clock);
+            rewritten = mergeNumberField("imagePosition", iconic.getImagePosition(), rewritten, incoming, clock);
+        }
+        rewritten = mergeStringField("name", getName(viewObject), rewritten, incoming, clock);
+        rewritten = mergeStringField("documentation", getDocumentation(viewObject), rewritten, incoming, clock);
+        return rewritten;
+    }
+
+    private String applyConnectionNotationLww(String connectionId,
+                                              IDiagramModelArchimateConnection connection,
+                                      String notationJson,
+                                      String opJson) {
+        FieldClock clock = connectionNotationClocks.computeIfAbsent(connectionId, id -> new FieldClock());
+        CausalClock causal = parseCausal(opJson);
+        String rewritten = notationJson;
+        rewritten = mergeNumberField("type", connection.getType(), rewritten, causal, clock);
+        rewritten = mergeBooleanField("nameVisible", connection.isNameVisible(), rewritten, causal, clock);
+        rewritten = mergeNumberField("textAlignment", connection.getTextAlignment(), rewritten, causal, clock);
+        rewritten = mergeNumberField("textPosition", connection.getTextPosition(), rewritten, causal, clock);
+        rewritten = mergeNumberField("lineWidth", connection.getLineWidth(), rewritten, causal, clock);
+        rewritten = mergeStringField("name", getName(connection), rewritten, causal, clock);
+        rewritten = mergeStringField("lineColor", connection.getLineColor(), rewritten, causal, clock);
+        rewritten = mergeStringField("font", connection.getFont(), rewritten, causal, clock);
+        rewritten = mergeStringField("fontColor", connection.getFontColor(), rewritten, causal, clock);
+        rewritten = mergeStringField("documentation", getDocumentation(connection), rewritten, causal, clock);
+        if(SimpleJson.hasField(rewritten, "bendpoints")) {
+            rewritten = mergeRawField("bendpoints", bendpointsJson(connection), rewritten, causal, clock);
+        }
+        return rewritten;
+    }
+
+    private String mergeNumberField(String field,
+                                      int currentValue,
+                                      String notationJson,
+                                      CausalClock incoming,
+                                      FieldClock clock) {
+        if(!SimpleJson.hasField(notationJson, field)) {
+            return notationJson;
+        }
+
+        CausalClock existing = clock.get(field);
+        if(wins(incoming, existing)) {
+            clock.set(field, incoming);
+            return notationJson;
+        }
+
+        String rewritten = overwriteNumberField(notationJson, field, currentValue);
+        ArchiCollabPlugin.logTrace("Ignored stale notation field " + field + " incomingLamport="
+                + incoming.lamport + " incomingClientId=" + incoming.clientId
+                + " existingLamport=" + existing.lamport + " existingClientId=" + existing.clientId);
+        return rewritten;
+    }
+
+    private String mergeBooleanField(String field,
+                                     boolean currentValue,
+                                     String notationJson,
+                                     CausalClock incoming,
+                                     FieldClock clock) {
+        if(!SimpleJson.hasField(notationJson, field)) {
+            return notationJson;
+        }
+        CausalClock existing = clock.get(field);
+        if(wins(incoming, existing)) {
+            clock.set(field, incoming);
+            return notationJson;
+        }
+        String rewritten = overwriteBooleanField(notationJson, field, currentValue);
+        ArchiCollabPlugin.logTrace("Ignored stale notation field " + field + " incomingLamport="
+                + incoming.lamport + " incomingClientId=" + incoming.clientId
+                + " existingLamport=" + existing.lamport + " existingClientId=" + existing.clientId);
+        return rewritten;
+    }
+
+    private String mergeStringField(String field,
+                                    String currentValue,
+                                    String notationJson,
+                                    CausalClock incoming,
+                                    FieldClock clock) {
+        if(!SimpleJson.hasField(notationJson, field)) {
+            return notationJson;
+        }
+        CausalClock existing = clock.get(field);
+        if(wins(incoming, existing)) {
+            clock.set(field, incoming);
+            return notationJson;
+        }
+        String rewritten = overwriteNullableStringField(notationJson, field, currentValue);
+        ArchiCollabPlugin.logTrace("Ignored stale notation field " + field + " incomingLamport="
+                + incoming.lamport + " incomingClientId=" + incoming.clientId
+                + " existingLamport=" + existing.lamport + " existingClientId=" + existing.clientId);
+        return rewritten;
+    }
+
+    private String mergeRawField(String field,
+                                 String currentRawJson,
+                                 String notationJson,
+                                 CausalClock incoming,
+                                 FieldClock clock) {
+        CausalClock existing = clock.get(field);
+        if(wins(incoming, existing)) {
+            clock.set(field, incoming);
+            return notationJson;
+        }
+        String rewritten = overwriteRawField(notationJson, field, currentRawJson);
+        ArchiCollabPlugin.logTrace("Ignored stale notation field " + field + " incomingLamport="
+                + incoming.lamport + " incomingClientId=" + incoming.clientId
+                + " existingLamport=" + existing.lamport + " existingClientId=" + existing.clientId);
+        return rewritten;
+    }
+
+    private String overwriteNumberField(String notationJson, String field, int replacementValue) {
+        Pattern pattern = Pattern.compile("(\\\"" + Pattern.quote(field) + "\\\"\\s*:\\s*)-?\\d+");
+        Matcher matcher = pattern.matcher(notationJson);
+        if(!matcher.find()) {
+            return notationJson;
+        }
+        return matcher.replaceFirst(Matcher.quoteReplacement(matcher.group(1) + replacementValue));
+    }
+
+    private String overwriteBooleanField(String notationJson, String field, boolean replacementValue) {
+        Pattern pattern = Pattern.compile("(\\\"" + Pattern.quote(field) + "\\\"\\s*:\\s*)(true|false)");
+        Matcher matcher = pattern.matcher(notationJson);
+        if(!matcher.find()) {
+            return notationJson;
+        }
+        return matcher.replaceFirst(Matcher.quoteReplacement(matcher.group(1) + replacementValue));
+    }
+
+    private String overwriteNullableStringField(String notationJson, String field, String replacementValue) {
+        Pattern pattern = Pattern.compile("(\\\"" + Pattern.quote(field) + "\\\"\\s*:\\s*)(null|\\\"(?:\\\\\\\\.|[^\\\"])*\\\")");
+        Matcher matcher = pattern.matcher(notationJson);
+        if(!matcher.find()) {
+            return notationJson;
+        }
+        return matcher.replaceFirst(Matcher.quoteReplacement(matcher.group(1) + jsonStringOrNull(replacementValue)));
+    }
+
+    private String overwriteRawField(String notationJson, String field, String rawJson) {
+        Pattern pattern = Pattern.compile("(\\\"" + Pattern.quote(field) + "\\\"\\s*:\\s*)\\[[^\\]]*\\]");
+        Matcher matcher = pattern.matcher(notationJson);
+        if(!matcher.find()) {
+            return notationJson;
+        }
+        return matcher.replaceFirst(Matcher.quoteReplacement(matcher.group(1) + rawJson));
+    }
+
+    private CausalClock parseCausal(String opJson) {
+        String causalJson = SimpleJson.asJsonObject(SimpleJson.readRawField(opJson, "causal"));
+        Long lamport = SimpleJson.readLongField(causalJson, "lamport");
+        String clientId = SimpleJson.readStringField(causalJson, "clientId");
+        return new CausalClock(lamport == null ? 0L : lamport, clientId == null ? "" : clientId);
+    }
+
+    private boolean wins(CausalClock incoming, CausalClock existing) {
+        if(incoming.lamport > existing.lamport) {
+            return true;
+        }
+        if(incoming.lamport < existing.lamport) {
+            return false;
+        }
+        return incoming.clientId.compareTo(existing.clientId) >= 0;
+    }
+
+    private String bendpointsJson(IDiagramModelArchimateConnection connection) {
+        StringBuilder json = new StringBuilder("[");
+        for(int i = 0; i < connection.getBendpoints().size(); i++) {
+            var bendpoint = connection.getBendpoints().get(i);
+            json.append("{")
+                    .append("\"startX\":").append(bendpoint.getStartX()).append(",")
+                    .append("\"startY\":").append(bendpoint.getStartY()).append(",")
+                    .append("\"endX\":").append(bendpoint.getEndX()).append(",")
+                    .append("\"endY\":").append(bendpoint.getEndY())
+                    .append("}");
+            if(i < connection.getBendpoints().size() - 1) {
+                json.append(",");
+            }
+        }
+        json.append("]");
+        return json.toString();
+    }
+
+    private String jsonStringOrNull(String value) {
+        if(value == null) {
+            return "null";
+        }
+        return "\"" + escapeJson(value) + "\"";
+    }
+
+    private String escapeJson(String value) {
+        if(value == null) {
+            return "";
+        }
+        return value.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
+
+    private List<String> extractNotationFields(String notationJson) {
+        List<String> fields = new ArrayList<>();
+        Pattern pattern = Pattern.compile("\\\"([A-Za-z0-9_]+)\\\"\\s*:");
+        Matcher matcher = pattern.matcher(notationJson == null ? "" : notationJson);
+        while(matcher.find()) {
+            fields.add(matcher.group(1));
+        }
+        return fields;
+    }
+
+    private static final class FieldClock {
+        private static final CausalClock UNKNOWN = new CausalClock(-1L, "");
+        private final Map<String, CausalClock> byField = new HashMap<>();
+
+        CausalClock get(String field) {
+            return byField.getOrDefault(field, UNKNOWN);
+        }
+
+        void set(String field, CausalClock clock) {
+            byField.put(field, clock);
+        }
+    }
+
+    private record CausalClock(long lamport, String clientId) {
     }
 
 }

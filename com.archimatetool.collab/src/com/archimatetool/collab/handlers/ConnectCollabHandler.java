@@ -46,6 +46,7 @@ public class ConnectCollabHandler extends AbstractHandler {
         }
 
         sessionManager.setActor(dialog.getUserId(), dialog.getSessionId());
+        sessionManager.setServerBackedSession(true);
         sessionManager.connect(dialog.getWsBaseUrl(), dialog.getModelId());
         if(model != null && sessionManager.isConnected()) {
             sessionManager.attachModel(model);

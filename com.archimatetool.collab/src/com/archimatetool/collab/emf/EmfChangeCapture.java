@@ -58,11 +58,17 @@ public class EmfChangeCapture extends EContentAdapter {
             return;
         }
 
-        if(notification.getNotifier() == null || sessionManager == null || !sessionManager.isConnected()) {
+        boolean hasCollabModelContext = sessionManager != null
+                && sessionManager.getCurrentModelId() != null
+                && !sessionManager.getCurrentModelId().isBlank();
+        if(notification.getNotifier() == null
+                || sessionManager == null
+                || (!sessionManager.isConnected() && !hasCollabModelContext)) {
             ArchiCollabPlugin.logTrace("EMF event ignored: notifier/session missing or disconnected"
                     + " notifierNull=" + (notification.getNotifier() == null)
                     + " sessionNull=" + (sessionManager == null)
-                    + " connected=" + (sessionManager != null && sessionManager.isConnected()));
+                    + " connected=" + (sessionManager != null && sessionManager.isConnected())
+                    + " hasContext=" + hasCollabModelContext);
             return;
         }
 

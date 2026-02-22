@@ -25,6 +25,7 @@ import com.archimatetool.model.IProperty;
  * Maps local EMF objects to collaboration operation envelopes.
  */
 public class OpMapper {
+    private long lamportCounter = System.currentTimeMillis();
 
     public String toCreateElementSubmitOps(IArchimateElement element, String modelId, long baseRevision, String userId, String sessionId) {
         String elementId = prefixedId("elem", element);
@@ -294,20 +295,55 @@ public class OpMapper {
     }
 
     private String submitOpsEnvelope(String modelId, long baseRevision, String userId, String sessionId, String opJson) {
+        String opBatchId = UUID.randomUUID().toString();
+        String opWithCausal = withCausal(opJson, userId, sessionId, opBatchId);
         return "{" +
                 "\"type\":\"SubmitOps\"," +
                 "\"payload\":{" +
                 "\"modelId\":\"" + escape(modelId) + "\"," +
                 "\"baseRevision\":" + baseRevision + "," +
-                "\"opBatchId\":\"" + UUID.randomUUID() + "\"," +
+                "\"opBatchId\":\"" + opBatchId + "\"," +
                 "\"actor\":{" +
                 "\"userId\":\"" + escape(userId) + "\"," +
                 "\"sessionId\":\"" + escape(sessionId) + "\"" +
                 "}," +
                 "\"timestamp\":\"" + Instant.now() + "\"," +
-                "\"ops\":[" + opJson + "]" +
+                "\"ops\":[" + opWithCausal + "]" +
                 "}" +
                 "}";
+    }
+
+    private synchronized long nextLamport() {
+        long now = System.currentTimeMillis();
+        lamportCounter = Math.max(lamportCounter + 1, now);
+        return lamportCounter;
+    }
+
+    private String withCausal(String opJson, String userId, String sessionId, String opBatchId) {
+        if(opJson == null || opJson.isBlank()) {
+            return opJson;
+        }
+
+        String clientId = sessionId;
+        if(clientId == null || clientId.isBlank()) {
+            clientId = userId;
+        }
+        if(clientId == null || clientId.isBlank()) {
+            clientId = "anonymous-session";
+        }
+
+        long lamport = nextLamport();
+        String causal = "\"causal\":{" +
+                "\"clientId\":\"" + escape(clientId) + "\"," +
+                "\"lamport\":" + lamport + "," +
+                "\"opId\":\"" + escape(opBatchId + ":0") + "\"" +
+                "}";
+
+        String trimmed = opJson.trim();
+        if(trimmed.endsWith("}")) {
+            return trimmed.substring(0, trimmed.length() - 1) + "," + causal + "}";
+        }
+        return trimmed;
     }
 
     private String getName(Object object) {
