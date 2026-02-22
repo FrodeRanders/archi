@@ -50,6 +50,11 @@ public class RemoteOpApplier {
     private final CollabSessionManager sessionManager;
     private final NotationDeserializer notationDeserializer = new NotationDeserializer();
     private final List<DeferredOp> deferredOps = new ArrayList<>();
+    private final Map<String, FieldClock> elementFieldClocks = new HashMap<>();
+    private final Map<String, CausalClock> elementTombstones = new HashMap<>();
+    private final Map<String, CausalClock> propertyClocks = new HashMap<>();
+    private final Map<String, CausalClock> propertyTombstones = new HashMap<>();
+    private final Map<String, PropertySetMemberClock> propertySetMemberClocks = new HashMap<>();
     private final Map<String, FieldClock> viewObjectNotationClocks = new HashMap<>();
     private final Map<String, FieldClock> connectionNotationClocks = new HashMap<>();
     private boolean deferredRetryScheduled;
@@ -395,6 +400,8 @@ public class RemoteOpApplier {
             case "DeleteConnection" -> applyDeleteConnection(opJson);
             case "SetProperty" -> applySetProperty(opJson);
             case "UnsetProperty" -> applyUnsetProperty(opJson);
+            case "AddPropertySetMember" -> applyAddPropertySetMember(opJson);
+            case "RemovePropertySetMember" -> applyRemovePropertySetMember(opJson);
             case "UpdateViewObjectOpaque" -> applyViewObjectOpaque(opJson);
             case "UpdateConnectionOpaque" -> applyConnectionOpaque(opJson);
             default -> false;
@@ -408,6 +415,13 @@ public class RemoteOpApplier {
         }
 
         String elementId = stripPrefix(SimpleJson.readStringField(elementJson, "id"), "elem:");
+        CausalClock incoming = parseCausal(opJson);
+        CausalClock tombstone = elementTombstones.get(elementId);
+        if(!CrdtEntityMerge.shouldApplyCreate(toMergeClock(incoming), toMergeClock(tombstone))) {
+            ArchiCollabPlugin.logTrace("Ignored stale CreateElement id=elem:" + elementId
+                    + " due to tombstone incomingLamport=" + incoming.lamport + " tombstoneLamport=" + tombstone.lamport);
+            return false;
+        }
         if(elementId == null || findObjectById(elementId) != null) {
             return false;
         }
@@ -432,6 +446,8 @@ public class RemoteOpApplier {
             return false;
         }
         model.getDefaultFolderForObject(concept).getElements().add(concept);
+        elementTombstones.remove(elementId);
+        seedElementClock(elementId, elementJson, incoming);
         ArchiCollabPlugin.logTrace("Applied CreateElement id=elem:" + elementId + " name=" + getName(concept));
         return true;
     }
@@ -439,16 +455,40 @@ public class RemoteOpApplier {
     private boolean applyUpdateElement(String opJson) {
         String elementId = stripPrefix(SimpleJson.readStringField(opJson, "elementId"), "elem:");
         String patchJson = SimpleJson.asJsonObject(SimpleJson.readRawField(opJson, "patch"));
+        CausalClock incoming = parseCausal(opJson);
+        CausalClock tombstone = elementTombstones.get(elementId);
+        if(!CrdtEntityMerge.shouldApplyUpdate(toMergeClock(incoming), toMergeClock(tombstone))) {
+            ArchiCollabPlugin.logTrace("Ignored stale UpdateElement id=elem:" + elementId
+                    + " due to tombstone incomingLamport=" + incoming.lamport + " tombstoneLamport=" + tombstone.lamport);
+            return false;
+        }
         EObject eObject = findObjectById(elementId);
         if(!(eObject instanceof IArchimateConcept concept) || patchJson == null) {
             return false;
         }
 
-        if(concept instanceof INameable nameable) {
-            setIfPresentName(nameable, patchJson, "name");
+        FieldClock clock = elementFieldClocks.computeIfAbsent(elementId, id -> new FieldClock());
+        if(concept instanceof INameable nameable && SimpleJson.hasField(patchJson, "name")) {
+            CausalClock existing = clock.get("name");
+            if(wins(incoming, existing)) {
+                setIfPresentName(nameable, patchJson, "name");
+                clock.set("name", incoming);
+            }
+            else {
+                ArchiCollabPlugin.logTrace("Ignored stale element field name for id=elem:" + elementId
+                        + " incomingLamport=" + incoming.lamport + " existingLamport=" + existing.lamport);
+            }
         }
-        if(concept instanceof IDocumentable documentable) {
-            setIfPresentDocumentation(documentable, patchJson, "documentation");
+        if(concept instanceof IDocumentable documentable && SimpleJson.hasField(patchJson, "documentation")) {
+            CausalClock existing = clock.get("documentation");
+            if(wins(incoming, existing)) {
+                setIfPresentDocumentation(documentable, patchJson, "documentation");
+                clock.set("documentation", incoming);
+            }
+            else {
+                ArchiCollabPlugin.logTrace("Ignored stale element field documentation for id=elem:" + elementId
+                        + " incomingLamport=" + incoming.lamport + " existingLamport=" + existing.lamport);
+            }
         }
         ArchiCollabPlugin.logTrace("Applied UpdateElement id=elem:" + elementId + " patch=" + summarizePatch(patchJson));
         return true;
@@ -456,9 +496,16 @@ public class RemoteOpApplier {
 
     private boolean applyDeleteElement(String opJson) {
         String elementId = stripPrefix(SimpleJson.readStringField(opJson, "elementId"), "elem:");
+        CausalClock incoming = parseCausal(opJson);
+        CausalClock existingTombstone = elementTombstones.get(elementId);
+        if(CrdtEntityMerge.shouldAdvanceTombstone(toMergeClock(incoming), toMergeClock(existingTombstone))) {
+            elementTombstones.put(elementId, incoming);
+        }
+        elementFieldClocks.remove(elementId);
         EObject eObject = findObjectById(elementId);
         if(eObject == null) {
-            return false;
+            ArchiCollabPlugin.logTrace("Applied DeleteElement tombstone only id=elem:" + elementId);
+            return true;
         }
         if(eObject instanceof IArchimateConcept concept) {
             // Delete all diagram components that reference this concept first.
@@ -764,6 +811,21 @@ public class RemoteOpApplier {
         if(targetId == null || key == null || key.isBlank()) {
             return false;
         }
+        CausalClock incoming = parseCausal(opJson);
+        String propertyKey = propertyKey(targetId, key);
+        CausalClock tombstone = propertyTombstones.get(propertyKey);
+        CausalClock existingClock = propertyClocks.get(propertyKey);
+        if(!CrdtPropertyMerge.shouldApplySet(
+                toMergeClock(incoming),
+                toMergeClock(existingClock),
+                toMergeClock(tombstone))) {
+            ArchiCollabPlugin.logTrace("Ignored stale SetProperty target=" + targetId + " key=" + key
+                    + " incomingLamport=" + incoming.lamport
+                    + " existingLamport=" + (existingClock == null ? "n/a" : existingClock.lamport)
+                    + " tombstoneLamport=" + (tombstone == null ? "n/a" : tombstone.lamport));
+            return false;
+        }
+
         EObject eObject = findPrefixedObject(targetId);
         if(!(eObject instanceof IProperties properties)) {
             return false;
@@ -773,6 +835,8 @@ public class RemoteOpApplier {
         for(IProperty property : properties.getProperties()) {
             if(key.equals(property.getKey())) {
                 property.setValue(value);
+                propertyClocks.put(propertyKey, incoming);
+                propertyTombstones.remove(propertyKey);
                 ArchiCollabPlugin.logTrace("Applied SetProperty target=" + targetId + " key=" + key + " value=" + value);
                 return true;
             }
@@ -782,6 +846,8 @@ public class RemoteOpApplier {
         property.setKey(key);
         property.setValue(value);
         properties.getProperties().add(property);
+        propertyClocks.put(propertyKey, incoming);
+        propertyTombstones.remove(propertyKey);
         ArchiCollabPlugin.logTrace("Applied SetProperty target=" + targetId + " key=" + key + " value=" + value + " (new)");
         return true;
     }
@@ -792,9 +858,25 @@ public class RemoteOpApplier {
         if(targetId == null || key == null || key.isBlank()) {
             return false;
         }
+        CausalClock incoming = parseCausal(opJson);
+        String propertyKey = propertyKey(targetId, key);
+        CausalClock existingClock = propertyClocks.get(propertyKey);
+        CausalClock existingTombstone = propertyTombstones.get(propertyKey);
+        if(!CrdtPropertyMerge.shouldApplyUnset(
+                toMergeClock(incoming),
+                toMergeClock(existingClock),
+                toMergeClock(existingTombstone))) {
+            ArchiCollabPlugin.logTrace("Ignored stale UnsetProperty target=" + targetId + " key=" + key
+                    + " incomingLamport=" + incoming.lamport);
+            return false;
+        }
+
         EObject eObject = findPrefixedObject(targetId);
         if(!(eObject instanceof IProperties properties)) {
-            return false;
+            propertyTombstones.put(propertyKey, incoming);
+            propertyClocks.remove(propertyKey);
+            ArchiCollabPlugin.logTrace("Applied UnsetProperty tombstone-only target=" + targetId + " key=" + key);
+            return true;
         }
 
         IProperty match = null;
@@ -806,10 +888,15 @@ public class RemoteOpApplier {
         }
         if(match != null) {
             properties.getProperties().remove(match);
+            propertyTombstones.put(propertyKey, incoming);
+            propertyClocks.remove(propertyKey);
             ArchiCollabPlugin.logTrace("Applied UnsetProperty target=" + targetId + " key=" + key);
             return true;
         }
-        return false;
+        propertyTombstones.put(propertyKey, incoming);
+        propertyClocks.remove(propertyKey);
+        ArchiCollabPlugin.logTrace("Applied UnsetProperty tombstone target=" + targetId + " key=" + key + " (missing key)");
+        return true;
     }
 
     private boolean applyViewObjectOpaque(String opJson) {
@@ -843,6 +930,68 @@ public class RemoteOpApplier {
         String effectiveNotation = applyConnectionNotationLww(connectionId, connection, notationJson, opJson);
         notationDeserializer.applyConnectionNotation(connection, effectiveNotation);
         ArchiCollabPlugin.logTrace("Applied UpdateConnectionOpaque id=conn:" + connectionId);
+        return true;
+    }
+
+    private boolean applyAddPropertySetMember(String opJson) {
+        String targetId = SimpleJson.readStringField(opJson, "targetId");
+        String key = SimpleJson.readStringField(opJson, "key");
+        String member = SimpleJson.readStringField(opJson, "member");
+        if(targetId == null || key == null || key.isBlank() || member == null || member.isBlank()) {
+            return false;
+        }
+        EObject eObject = findPrefixedObject(targetId);
+        if(!(eObject instanceof IProperties properties)) {
+            return false;
+        }
+
+        seedPropertySetStateFromCurrentValue(targetId, key, properties);
+        CausalClock incoming = parseCausal(opJson);
+        String memberKey = propertySetMemberKey(targetId, key, member);
+        PropertySetMemberClock existing = propertySetMemberClocks.get(memberKey);
+        CrdtPropertyMerge.Clock existingAdd = existing != null && !existing.deleted
+                ? toMergeClock(existing.clock)
+                : null;
+        CrdtPropertyMerge.Clock existingRemove = existing != null && existing.deleted
+                ? toMergeClock(existing.clock)
+                : null;
+        if(!CrdtOrSet.shouldApplyAdd(toMergeClock(incoming), existingAdd, existingRemove)) {
+            return false;
+        }
+
+        propertySetMemberClocks.put(memberKey, new PropertySetMemberClock(incoming, false));
+        materializePropertySetValue(targetId, key, properties);
+        return true;
+    }
+
+    private boolean applyRemovePropertySetMember(String opJson) {
+        String targetId = SimpleJson.readStringField(opJson, "targetId");
+        String key = SimpleJson.readStringField(opJson, "key");
+        String member = SimpleJson.readStringField(opJson, "member");
+        if(targetId == null || key == null || key.isBlank() || member == null || member.isBlank()) {
+            return false;
+        }
+        EObject eObject = findPrefixedObject(targetId);
+        if(!(eObject instanceof IProperties properties)) {
+            return false;
+        }
+
+        seedPropertySetStateFromCurrentValue(targetId, key, properties);
+        CausalClock incoming = parseCausal(opJson);
+        String memberKey = propertySetMemberKey(targetId, key, member);
+        PropertySetMemberClock existing = propertySetMemberClocks.get(memberKey);
+        CrdtPropertyMerge.Clock existingAdd = existing != null && !existing.deleted
+                ? toMergeClock(existing.clock)
+                : null;
+        CrdtPropertyMerge.Clock existingRemove = existing != null && existing.deleted
+                ? toMergeClock(existing.clock)
+                : null;
+        if(!CrdtOrSet.shouldApplyRemove(toMergeClock(incoming), existingAdd, existingRemove)) {
+            return false;
+        }
+
+        propertySetMemberClocks.put(memberKey, new PropertySetMemberClock(incoming, true));
+        materializePropertySetValue(targetId, key, properties);
         return true;
     }
 
@@ -961,6 +1110,10 @@ public class RemoteOpApplier {
         return object instanceof IDocumentable documentable ? documentable.getDocumentation() : "";
     }
 
+    private String propertyKey(String targetId, String key) {
+        return (targetId == null ? "" : targetId) + "#" + (key == null ? "" : key);
+    }
+
     private String summarizePatch(String patchJson) {
         if(patchJson == null) {
             return "{}";
@@ -1013,6 +1166,11 @@ public class RemoteOpApplier {
     }
 
     private void clearModelContents(IArchimateModel model) {
+        elementFieldClocks.clear();
+        elementTombstones.clear();
+        propertyClocks.clear();
+        propertyTombstones.clear();
+        propertySetMemberClocks.clear();
         viewObjectNotationClocks.clear();
         connectionNotationClocks.clear();
         List<EObject> views = new ArrayList<>();
@@ -1042,6 +1200,16 @@ public class RemoteOpApplier {
         FieldClock clock = viewObjectNotationClocks.computeIfAbsent(viewObjectId, id -> new FieldClock());
         CausalClock incoming = parseCausal(opJson);
         seedClockFromNotation(clock, notationJson, incoming);
+    }
+
+    private void seedElementClock(String elementId, String json, CausalClock incoming) {
+        FieldClock clock = elementFieldClocks.computeIfAbsent(elementId, id -> new FieldClock());
+        if(SimpleJson.hasField(json, "name")) {
+            clock.set("name", incoming);
+        }
+        if(SimpleJson.hasField(json, "documentation")) {
+            clock.set("documentation", incoming);
+        }
     }
 
     private void seedConnectionClock(String connectionId, String notationJson, String opJson) {
@@ -1240,13 +1408,11 @@ public class RemoteOpApplier {
     }
 
     private boolean wins(CausalClock incoming, CausalClock existing) {
-        if(incoming.lamport > existing.lamport) {
-            return true;
-        }
-        if(incoming.lamport < existing.lamport) {
-            return false;
-        }
-        return incoming.clientId.compareTo(existing.clientId) >= 0;
+        return CrdtPropertyMerge.wins(toMergeClock(incoming), toMergeClock(existing));
+    }
+
+    private CrdtPropertyMerge.Clock toMergeClock(CausalClock clock) {
+        return clock == null ? null : CrdtPropertyMerge.clock(clock.lamport, clock.clientId);
     }
 
     private String bendpointsJson(IDiagramModelArchimateConnection connection) {
@@ -1305,6 +1471,129 @@ public class RemoteOpApplier {
     }
 
     private record CausalClock(long lamport, String clientId) {
+    }
+
+    private record PropertySetMemberClock(CausalClock clock, boolean deleted) {
+    }
+
+    private void seedPropertySetStateFromCurrentValue(String targetId, String key, IProperties properties) {
+        String prefix = propertySetMemberPrefix(targetId, key);
+        boolean alreadySeeded = propertySetMemberClocks.keySet().stream().anyMatch(k -> k.startsWith(prefix));
+        if(alreadySeeded) {
+            return;
+        }
+        String current = null;
+        for(IProperty property : properties.getProperties()) {
+            if(key.equals(property.getKey())) {
+                current = property.getValue();
+                break;
+            }
+        }
+        for(String member : parseStringArray(current)) {
+            propertySetMemberClocks.put(propertySetMemberKey(targetId, key, member),
+                    new PropertySetMemberClock(new CausalClock(-1L, ""), false));
+        }
+    }
+
+    private void materializePropertySetValue(String targetId, String key, IProperties properties) {
+        String prefix = propertySetMemberPrefix(targetId, key);
+        List<String> members = new ArrayList<>();
+        for(Map.Entry<String, PropertySetMemberClock> entry : propertySetMemberClocks.entrySet()) {
+            if(!entry.getKey().startsWith(prefix) || entry.getValue().deleted) {
+                continue;
+            }
+            String member = entry.getKey().substring(prefix.length());
+            if(!member.isBlank()) {
+                members.add(member);
+            }
+        }
+        members.sort(String::compareTo);
+
+        IProperty match = null;
+        for(IProperty property : properties.getProperties()) {
+            if(key.equals(property.getKey())) {
+                match = property;
+                break;
+            }
+        }
+
+        if(members.isEmpty()) {
+            if(match != null) {
+                properties.getProperties().remove(match);
+            }
+            return;
+        }
+
+        String value = toJsonStringArray(members);
+        if(match == null) {
+            IProperty property = IArchimateFactory.eINSTANCE.createProperty();
+            property.setKey(key);
+            property.setValue(value);
+            properties.getProperties().add(property);
+            return;
+        }
+        match.setValue(value);
+    }
+
+    private String propertySetMemberPrefix(String targetId, String key) {
+        return targetId + "\u001f" + key + "\u001f";
+    }
+
+    private String propertySetMemberKey(String targetId, String key, String member) {
+        return propertySetMemberPrefix(targetId, key) + member;
+    }
+
+    private List<String> parseStringArray(String rawValue) {
+        List<String> values = new ArrayList<>();
+        if(rawValue == null) {
+            return values;
+        }
+        String text = rawValue.trim();
+        if(text.length() < 2 || text.charAt(0) != '[' || text.charAt(text.length() - 1) != ']') {
+            return values;
+        }
+
+        boolean inString = false;
+        boolean escaped = false;
+        int start = -1;
+        for(int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if(!inString) {
+                if(c == '"') {
+                    inString = true;
+                    start = i + 1;
+                }
+                continue;
+            }
+            if(escaped) {
+                escaped = false;
+                continue;
+            }
+            if(c == '\\') {
+                escaped = true;
+                continue;
+            }
+            if(c == '"') {
+                if(start >= 0 && start <= i) {
+                    values.add(SimpleJson.decodeString(text.substring(start, i)));
+                }
+                inString = false;
+                start = -1;
+            }
+        }
+        return values;
+    }
+
+    private String toJsonStringArray(List<String> values) {
+        StringBuilder out = new StringBuilder("[");
+        for(int i = 0; i < values.size(); i++) {
+            if(i > 0) {
+                out.append(",");
+            }
+            out.append("\"").append(escapeJson(values.get(i))).append("\"");
+        }
+        out.append("]");
+        return out.toString();
     }
 
 }

@@ -1,21 +1,18 @@
 package com.archimatetool.collab.emf;
 
 import java.time.Instant;
-import java.util.Iterator;
 import java.util.UUID;
 
+import com.archimatetool.collab.notation.NotationSerializer;
 import com.archimatetool.model.IArchimateElement;
 import com.archimatetool.model.IArchimateDiagramModel;
 import com.archimatetool.model.IArchimateRelationship;
 import com.archimatetool.model.IArchimateConcept;
-import com.archimatetool.model.IBounds;
 import com.archimatetool.model.IConnectable;
 import com.archimatetool.model.IDiagramModelArchimateConnection;
 import com.archimatetool.model.IDiagramModelArchimateObject;
-import com.archimatetool.model.IDiagramModelBendpoint;
 import com.archimatetool.model.IDiagramModelConnection;
 import com.archimatetool.model.IDiagramModel;
-import com.archimatetool.model.IIconic;
 import com.archimatetool.model.IDocumentable;
 import com.archimatetool.model.IIdentifier;
 import com.archimatetool.model.INameable;
@@ -26,6 +23,7 @@ import com.archimatetool.model.IProperty;
  */
 public class OpMapper {
     private long lamportCounter = System.currentTimeMillis();
+    private final NotationSerializer notationSerializer = new NotationSerializer();
 
     public String toCreateElementSubmitOps(IArchimateElement element, String modelId, long baseRevision, String userId, String sessionId) {
         String elementId = prefixedId("elem", element);
@@ -197,6 +195,7 @@ public class OpMapper {
         String op = "{" +
                 "\"type\":\"UpdateViewObjectOpaque\"," +
                 "\"viewObjectId\":\"" + escape(prefixedId("vo", viewObject)) + "\"," +
+                "\"viewId\":\"" + escape(prefixedId("view", viewObject.getDiagramModel())) + "\"," +
                 "\"notationJson\":" + notationJsonForViewObject(viewObject) +
                 "}";
         return submitOpsEnvelope(modelId, baseRevision, userId, sessionId, op);
@@ -205,7 +204,8 @@ public class OpMapper {
     public String toDeleteViewObjectSubmitOps(IDiagramModelArchimateObject viewObject, String modelId, long baseRevision, String userId, String sessionId) {
         String op = "{" +
                 "\"type\":\"DeleteViewObject\"," +
-                "\"viewObjectId\":\"" + escape(prefixedId("vo", viewObject)) + "\"" +
+                "\"viewObjectId\":\"" + escape(prefixedId("vo", viewObject)) + "\"," +
+                "\"viewId\":\"" + escape(prefixedId("view", viewObject.getDiagramModel())) + "\"" +
                 "}";
         return submitOpsEnvelope(modelId, baseRevision, userId, sessionId, op);
     }
@@ -235,6 +235,7 @@ public class OpMapper {
         String op = "{" +
                 "\"type\":\"UpdateConnectionOpaque\"," +
                 "\"connectionId\":\"" + escape(prefixedId("conn", connection)) + "\"," +
+                "\"viewId\":\"" + escape(prefixedId("view", connection.getDiagramModel())) + "\"," +
                 "\"notationJson\":" + notationJsonForConnection(connection) +
                 "}";
         return submitOpsEnvelope(modelId, baseRevision, userId, sessionId, op);
@@ -243,7 +244,8 @@ public class OpMapper {
     public String toDeleteConnectionSubmitOps(IDiagramModelArchimateConnection connection, String modelId, long baseRevision, String userId, String sessionId) {
         String op = "{" +
                 "\"type\":\"DeleteConnection\"," +
-                "\"connectionId\":\"" + escape(prefixedId("conn", connection)) + "\"" +
+                "\"connectionId\":\"" + escape(prefixedId("conn", connection)) + "\"," +
+                "\"viewId\":\"" + escape(prefixedId("view", connection.getDiagramModel())) + "\"" +
                 "}";
         return submitOpsEnvelope(modelId, baseRevision, userId, sessionId, op);
     }
@@ -263,6 +265,26 @@ public class OpMapper {
                 "\"type\":\"UnsetProperty\"," +
                 "\"targetId\":\"" + escape(targetId) + "\"," +
                 "\"key\":\"" + escape(key) + "\"" +
+                "}";
+        return submitOpsEnvelope(modelId, baseRevision, userId, sessionId, op);
+    }
+
+    public String toAddPropertySetMemberSubmitOps(String targetId, String key, String member, String modelId, long baseRevision, String userId, String sessionId) {
+        String op = "{" +
+                "\"type\":\"AddPropertySetMember\"," +
+                "\"targetId\":\"" + escape(targetId) + "\"," +
+                "\"key\":\"" + escape(key) + "\"," +
+                "\"member\":\"" + escape(member) + "\"" +
+                "}";
+        return submitOpsEnvelope(modelId, baseRevision, userId, sessionId, op);
+    }
+
+    public String toRemovePropertySetMemberSubmitOps(String targetId, String key, String member, String modelId, long baseRevision, String userId, String sessionId) {
+        String op = "{" +
+                "\"type\":\"RemovePropertySetMember\"," +
+                "\"targetId\":\"" + escape(targetId) + "\"," +
+                "\"key\":\"" + escape(key) + "\"," +
+                "\"member\":\"" + escape(member) + "\"" +
                 "}";
         return submitOpsEnvelope(modelId, baseRevision, userId, sessionId, op);
     }
@@ -375,68 +397,11 @@ public class OpMapper {
     }
 
     private String notationJsonForViewObject(IDiagramModelArchimateObject viewObject) {
-        StringBuilder json = new StringBuilder("{");
-        IBounds bounds = viewObject.getBounds();
-        if(bounds != null) {
-            json.append("\"x\":").append(bounds.getX()).append(",");
-            json.append("\"y\":").append(bounds.getY()).append(",");
-            json.append("\"width\":").append(bounds.getWidth()).append(",");
-            json.append("\"height\":").append(bounds.getHeight()).append(",");
-        }
-        json.append("\"type\":").append(viewObject.getType()).append(",");
-        json.append("\"alpha\":").append(viewObject.getAlpha()).append(",");
-        json.append("\"lineAlpha\":").append(viewObject.getLineAlpha()).append(",");
-        json.append("\"lineWidth\":").append(viewObject.getLineWidth()).append(",");
-        json.append("\"lineStyle\":").append(viewObject.getLineStyle()).append(",");
-        json.append("\"textAlignment\":").append(viewObject.getTextAlignment()).append(",");
-        json.append("\"textPosition\":").append(viewObject.getTextPosition()).append(",");
-        json.append("\"gradient\":").append(viewObject.getGradient()).append(",");
-        json.append("\"iconVisibleState\":").append(viewObject.getIconVisibleState()).append(",");
-        json.append("\"deriveElementLineColor\":").append(viewObject.getDeriveElementLineColor()).append(",");
-        json.append("\"fillColor\":").append(jsonValue(viewObject.getFillColor())).append(",");
-        json.append("\"lineColor\":").append(jsonValue(viewObject.getLineColor())).append(",");
-        json.append("\"font\":").append(jsonValue(viewObject.getFont())).append(",");
-        json.append("\"fontColor\":").append(jsonValue(viewObject.getFontColor())).append(",");
-        json.append("\"iconColor\":").append(jsonValue(viewObject.getIconColor())).append(",");
-        if(viewObject instanceof IIconic iconic) {
-            json.append("\"imagePath\":").append(jsonValue(iconic.getImagePath())).append(",");
-            json.append("\"imagePosition\":").append(iconic.getImagePosition()).append(",");
-        }
-        json.append("\"name\":").append(jsonValue(getName(viewObject))).append(",");
-        json.append("\"documentation\":").append(jsonValue(getDocumentation(viewObject)));
-        json.append("}");
-        return json.toString();
+        return notationSerializer.serializeViewObject(viewObject);
     }
 
     private String notationJsonForConnection(IDiagramModelArchimateConnection connection) {
-        StringBuilder json = new StringBuilder("{");
-        json.append("\"type\":").append(connection.getType()).append(",");
-        json.append("\"nameVisible\":").append(connection.isNameVisible()).append(",");
-        json.append("\"textAlignment\":").append(connection.getTextAlignment()).append(",");
-        json.append("\"textPosition\":").append(connection.getTextPosition()).append(",");
-        json.append("\"lineWidth\":").append(connection.getLineWidth()).append(",");
-        json.append("\"name\":").append(jsonValue(getName(connection))).append(",");
-        json.append("\"lineColor\":").append(jsonValue(connection.getLineColor())).append(",");
-        json.append("\"font\":").append(jsonValue(connection.getFont())).append(",");
-        json.append("\"fontColor\":").append(jsonValue(connection.getFontColor())).append(",");
-        json.append("\"documentation\":").append(jsonValue(getDocumentation(connection))).append(",");
-        json.append("\"bendpoints\":[");
-        Iterator<IDiagramModelBendpoint> it = connection.getBendpoints().iterator();
-        while(it.hasNext()) {
-            IDiagramModelBendpoint bendpoint = it.next();
-            json.append("{")
-                    .append("\"startX\":").append(bendpoint.getStartX()).append(",")
-                    .append("\"startY\":").append(bendpoint.getStartY()).append(",")
-                    .append("\"endX\":").append(bendpoint.getEndX()).append(",")
-                    .append("\"endY\":").append(bendpoint.getEndY())
-                    .append("}");
-            if(it.hasNext()) {
-                json.append(",");
-            }
-        }
-        json.append("]");
-        json.append("}");
-        return json.toString();
+        return notationSerializer.serializeConnection(connection);
     }
 
     private String jsonValue(Object value) {
