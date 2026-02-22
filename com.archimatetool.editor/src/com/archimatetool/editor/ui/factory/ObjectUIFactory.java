@@ -73,7 +73,9 @@ public class ObjectUIFactory {
         
         // We need to unwrap these here as this is called from diagram model objects
         if(eObject instanceof IDiagramModelArchimateComponent dmc) {
-            eClass = dmc.getArchimateConcept().eClass();
+            if(dmc.getArchimateConcept() != null) {
+                eClass = dmc.getArchimateConcept().eClass();
+            }
         }
         else if(eObject != null) {
             eClass = eObject.eClass();

@@ -435,8 +435,10 @@ implements IContextProvider, PropertyChangeListener, ITabbedPropertySheetPageCon
         // ArchiMate element
         if(container instanceof IDiagramModelArchimateObject) {
             IArchimateElement element = ((IDiagramModelArchimateObject)container).getArchimateElement();
-            list.add(element);
-            getRelationshipsToUpdate(list, element);
+            if(element != null) {
+                list.add(element);
+                getRelationshipsToUpdate(list, element);
+            }
         }
         
         // Children
@@ -452,6 +454,9 @@ implements IContextProvider, PropertyChangeListener, ITabbedPropertySheetPageCon
      * TODO: A3 Does this need to be for all concepts?
      */
     private void getRelationshipsToUpdate(Set<EObject> list, IArchimateElement element) {
+        if(element == null) {
+            return;
+        }
         for(IArchimateRelationship relation : ArchimateModelUtils.getAllRelationshipsForConcept(element)) {
             list.add(relation);
         }

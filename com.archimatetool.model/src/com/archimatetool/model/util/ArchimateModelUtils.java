@@ -182,6 +182,9 @@ public class ArchimateModelUtils {
      * @return A list of all relationships that a concept has, both as target and as source
      */
     public static List<IArchimateRelationship> getAllRelationshipsForConcept(IArchimateConcept concept) {
+        if(concept == null) {
+            return new ArrayList<>();
+        }
         Set<IArchimateRelationship> set = new HashSet<IArchimateRelationship>();
         set.addAll(concept.getSourceRelationships());
         set.addAll(concept.getTargetRelationships());

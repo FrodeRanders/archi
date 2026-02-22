@@ -66,7 +66,9 @@ public abstract class AbstractArchimateElementEditPart extends AbstractConnected
         super.addECoreAdapter();
         
         // Listen to changes in Archimate Element
-        getModel().getArchimateElement().eAdapters().add(getECoreAdapter());
+        if(getModel().getArchimateElement() != null) {
+            getModel().getArchimateElement().eAdapters().add(getECoreAdapter());
+        }
         
         // Listen to changes in Archimate Model for Profile changes
         fModel = getModel().getArchimateModel();
@@ -78,7 +80,9 @@ public abstract class AbstractArchimateElementEditPart extends AbstractConnected
         super.removeECoreAdapter();
         
         // Unlisten to changes in Archimate Element
-        getModel().getArchimateElement().eAdapters().remove(getECoreAdapter());
+        if(getModel().getArchimateElement() != null) {
+            getModel().getArchimateElement().eAdapters().remove(getECoreAdapter());
+        }
         
         // Unlisten to changes in Archimate Model
         if(fModel != null) {

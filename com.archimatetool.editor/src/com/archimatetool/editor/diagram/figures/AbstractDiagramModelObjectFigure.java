@@ -452,12 +452,14 @@ implements IDiagramModelObjectFigure {
         
         // If an ArchiMate type, set text to element type if blank
         if(getDiagramModelObject() instanceof IDiagramModelArchimateObject dmao) {
-            EClass eClass = dmao.getArchimateElement().eClass();
-            String type = ArchiLabelProvider.INSTANCE.getDefaultName(eClass);
-            if(!StringUtils.isSet(text)) { // Name was blank
-                toolTipFigure.setText(type);
+            if(dmao.getArchimateElement() != null) {
+                EClass eClass = dmao.getArchimateElement().eClass();
+                String type = ArchiLabelProvider.INSTANCE.getDefaultName(eClass);
+                if(!StringUtils.isSet(text)) { // Name was blank
+                    toolTipFigure.setText(type);
+                }
+                toolTipFigure.setType(Messages.AbstractDiagramModelObjectFigure_0 + " " + type); //$NON-NLS-1$
             }
-            toolTipFigure.setType(Messages.AbstractDiagramModelObjectFigure_0 + " " + type); //$NON-NLS-1$
         }
 
         return toolTipFigure;
